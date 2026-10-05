@@ -526,8 +526,32 @@ test("UniversalProjectQuestionEngine answers tech-stack inventory from structura
       }
     });
 
+    const provider = new GroundedProvider(
+      [
+        "## Full Tech Stack",
+        "",
+        "This workspace uses a mixed TypeScript, JavaScript, and Rust stack. The root package manifest declares React, Fastify, TypeScript, and Vite, which establishes the main JavaScript and TypeScript technologies present in the repository. React is present as a frontend dependency, Fastify is present as a server-side dependency, while TypeScript and Vite are declared as development tooling. [package.json:1](hivo-file:package.json:1)",
+        "",
+        "## Web and Application Layer",
+        "",
+        "The JavaScript ecosystem is defined from the root package manifest rather than inferred from filenames alone. React is explicitly declared in dependencies, and Fastify is also explicitly declared there. TypeScript and Vite appear in devDependencies, so the repository has direct manifest evidence for typed JavaScript development and Vite-based tooling. These claims come from the current workspace package.json and do not require assumptions about frameworks that are not listed. [package.json:1](hivo-file:package.json:1)",
+        "",
+        "## Desktop and Native Layer",
+        "",
+        "The desktop side uses Tauri with Rust and Cargo. The Cargo manifest under apps/desktop/src-tauri declares the Tauri crate directly, which provides current-workspace evidence for the native desktop layer. The same manifest also declares Tokio, showing that the Rust portion includes Tokio as a dependency. This section is based only on the dependencies recorded in the Cargo manifest. [apps/desktop/src-tauri/Cargo.toml:1](hivo-file:apps%2Fdesktop%2Fsrc-tauri%2FCargo.toml:1)",
+        "",
+        "## Storage",
+        "",
+        "SQLite support is represented through the Rust rusqlite dependency. The Cargo manifest explicitly declares rusqlite, so SQLite belongs in the confirmed technology inventory for this workspace. Taken together, the manifests prove a stack containing React, Fastify, TypeScript, Vite, Tauri, Rust / Cargo, Tokio, and SQLite through rusqlite. [apps/desktop/src-tauri/Cargo.toml:1](hivo-file:apps%2Fdesktop%2Fsrc-tauri%2FCargo.toml:1)"
+      ].join("\n"),
+      [
+        "package.json:1",
+        "apps/desktop/src-tauri/Cargo.toml:1"
+      ]
+    );
+
     const result = await answerUniversalProjectQuestion({
-      provider: new ThrowingProvider(),
+      provider,
       tools,
       userPrompt: prompt,
       explainReport: report

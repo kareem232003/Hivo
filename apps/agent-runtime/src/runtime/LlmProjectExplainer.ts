@@ -784,7 +784,8 @@ function isStructuralFileContextQuestion(userPrompt: string) {
     || /\buse\s+the\s+detected\s+candidates\b/.test(normalized) && /\bmain\b|\bentry\b|\bbackend\s+main\b|\bapp\s+js\b|\bapp\s+ts\b|\bapp\s+tsx\b|\bapp\s+jsx\b/.test(normalized)
     || /\bdetected\s+source\s+files\b/.test(normalized) && /\bconnect\b/.test(normalized) && /\bflow\b/.test(normalized)
     || /\bbackend\b/.test(normalized) && /\bfrontend\b/.test(normalized) && /\b(connect|wire|flow|source\s+files)\b/.test(normalized)
-    || /\buse\s+only\s+project\s+files\s+such\s+as\b/.test(normalized) && /\b(connect|flow|backend|frontend)\b/.test(normalized);
+    || /\buse\s+only\s+project\s+files\s+such\s+as\b/.test(normalized) && /\b(connect|flow|backend|frontend)\b/.test(normalized)
+    || /\b(?:tech|technology)\s+stack\b/i.test(normalized);
 }
 
 function naturalTextToProjectExplainResponse(markdown: string): ProjectExplainLlmResponse {

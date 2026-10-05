@@ -201,7 +201,15 @@ export function inferTargetConcept(input: {
 }
 
 function isStructuralFileContextQuestion(question: string) {
-  return isEntrypointInventoryQuestion(question) || isSourceFlowFileQuestion(question);
+  return isEntrypointInventoryQuestion(question)
+    || isSourceFlowFileQuestion(question)
+    || isTechStackInventoryQuestion(question);
+}
+
+function isTechStackInventoryQuestion(question: string) {
+  const normalized = normalizeConceptTerm(question);
+
+  return /\b(?:tech|technology)\s+stack\b/.test(normalized);
 }
 
 function isEntrypointInventoryQuestion(question: string) {
