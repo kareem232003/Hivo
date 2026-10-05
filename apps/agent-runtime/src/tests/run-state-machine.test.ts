@@ -20,6 +20,7 @@ import {
   type Run,
   type Task
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("run state machine accepts the happy-path execution lifecycle", () => {
   const statuses = [
@@ -107,7 +108,10 @@ test("run state machine maps legacy public statuses to canonical lifecycle state
 test("CoreOrchestrator plan-only run writes transition metadata and preserves artifact layout", async () => {
   const workspace = await fixtureWorkspace("factory-state-plan");
   try {
-    const result = await new CoreOrchestrator({ workspacePath: workspace }).planOnly("Explain src/index.ts without changing files.");
+    const result = await new CoreOrchestrator({
+      workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider()
+    }).planOnly("Explain src/index.ts without changing files.");
     assert.equal(result.run.status, "succeeded");
     assert.match(result.run.artifacts_path, /[\\\/]\.agent_memory[\\\/]runs[\\\/]run_/);
     assert.equal(existsSync(path.join(result.run.artifacts_path, "run.json")), true);

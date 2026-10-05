@@ -25,6 +25,7 @@ import {
   type RenderedPrompt,
   type Task
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("prompt quality model reports passed warning failed blocked and not_required", () => {
   const passed = evaluatePromptQuality(rendered("ExecutorAgent"), context());
@@ -210,6 +211,7 @@ test("CoreOrchestrator records prompt quality before agent invocation", async ()
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 2500
     }).runAgenticTask("Explain src/index.ts and do not change files.");

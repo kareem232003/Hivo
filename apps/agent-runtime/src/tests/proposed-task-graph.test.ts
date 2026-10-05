@@ -24,6 +24,7 @@ import {
   type Task
 } from "../orchestration/index.js";
 import { TaskGraphManager } from "../orchestration/TaskGraphManager.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("proposed task graph models create graph node edge and validation summary", () => {
   const node = createProposedTaskGraphNode({
@@ -196,6 +197,7 @@ test("CoreOrchestrator plan-only run builds proposed graph without ready executo
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 3000,
       config: {

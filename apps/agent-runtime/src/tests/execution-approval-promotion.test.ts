@@ -26,6 +26,7 @@ import {
   type Task
 } from "../orchestration/index.js";
 import { TaskGraphManager } from "../orchestration/TaskGraphManager.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("execution approval models create requests approval records queue items and constraints", () => {
   const scope = createApprovalScope({ allowed_files: ["src/runtime.ts"], forbidden_files: [".env"], required_locks: ["module:src"] });
@@ -227,6 +228,7 @@ test("CoreOrchestrator readiness batch creates promotion requests and report met
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 3000,
       config: {

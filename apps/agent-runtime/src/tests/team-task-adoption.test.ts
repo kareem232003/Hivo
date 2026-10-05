@@ -28,6 +28,7 @@ import {
   type TaskPromotionPolicy,
   type TeamSubPlan
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("team task adoption models create request proposal readiness decision and findings", () => {
   const request = createTeamTaskAdoptionRequest({
@@ -218,6 +219,7 @@ test("CoreOrchestrator plan-only run evaluates sub-plan drafts without making ex
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 3000,
       config: {

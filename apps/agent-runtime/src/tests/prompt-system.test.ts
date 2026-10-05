@@ -24,6 +24,7 @@ import {
   type AgentInvocation,
   type Task
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("prompt registry registers retrieves and falls back for role templates", () => {
   const registry = new PromptTemplateRegistry();
@@ -202,6 +203,7 @@ test("CoreOrchestrator uses PromptSystem while preserving execution and artifact
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 2500
     }).runAgenticTask("Explain src/index.ts and do not change files.");

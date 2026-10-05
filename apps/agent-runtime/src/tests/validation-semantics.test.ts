@@ -19,6 +19,7 @@ import {
   validationStatusToRunImpact,
   type Task
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("validation aggregation reports all required commands passed", () => {
   const result = aggregateValidationStatus([
@@ -218,7 +219,10 @@ test("run lifecycle accepts passed validation and blocks failed partial or not-r
 test("plan-only report states validation was not required", async () => {
   const workspace = await fixtureWorkspace("validation-plan-report");
   try {
-    const result = await new CoreOrchestrator({ workspacePath: workspace })
+    const result = await new CoreOrchestrator({
+      workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider()
+    })
       .planOnly("Explain src/index.ts without changing files.");
     assert.equal(result.run.status, "succeeded");
     assert.ok(result.report.limitations.some((limitation) => limitation.includes("Validation not required")));

@@ -32,8 +32,8 @@ import {
   type ExecutionPromotionRequest,
   type HumanApprovalRecord,
   type PromotionQueueItem,
-  type ProposedTaskGraphNode
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("execution preparation models create plans batches blockers and warnings", () => {
   const blocker = createExecutionPreparationBlocker({
@@ -212,6 +212,7 @@ test("CoreOrchestrator creates preparation plans after promotion queue without c
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 3000,
       config: {

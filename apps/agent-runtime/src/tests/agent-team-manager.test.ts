@@ -18,6 +18,7 @@ import {
   type Run,
   type WorkItem
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("agent team models create root domain and specialist team shapes with memory scopes", () => {
   const root = createAgentTeam({
@@ -260,6 +261,7 @@ test("CoreOrchestrator plan-only medium run creates team metadata without changi
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       config: {
         enable_team_sub_planning: false,
         enable_team_task_adoption: false,

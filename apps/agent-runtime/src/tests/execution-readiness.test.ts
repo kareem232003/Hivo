@@ -31,6 +31,7 @@ import {
   type Task
 } from "../orchestration/index.js";
 import { TaskGraphManager } from "../orchestration/TaskGraphManager.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("execution readiness models create decisions approval requirements batches and blockers", () => {
   const request = createExecutionReadinessRequest({
@@ -228,6 +229,7 @@ test("CoreOrchestrator plan-only run evaluates execution readiness without sched
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 3000,
       config: {

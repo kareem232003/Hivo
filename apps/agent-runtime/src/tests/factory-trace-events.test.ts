@@ -14,8 +14,11 @@ import {
   createFactoryTraceEvent,
   reconstructFactoryRunTrace,
   transitionRun,
+  IntentHandoffGate,
+  createAlignmentFromFrame,
   type SwarmWorker
 } from "../orchestration/index.js";
+import { ScriptedProvider } from "./fixtures/ScriptedProvider.js";
 
 test("factory trace writer inserts SQLite trace events with artifact refs and causal parent links", async () => {
   const workspace = await fixtureWorkspace("factory-trace-sqlite");
@@ -184,7 +187,10 @@ test("trace reconstruction returns an ordered timeline and blocked or failed cha
 test("CoreOrchestrator emits plan-only trace events while preserving artifact layout and events.jsonl", async () => {
   const workspace = await fixtureWorkspace("factory-trace-core-plan");
   try {
-    const result = await new CoreOrchestrator({ workspacePath: workspace }).planOnly("Explain src/index.ts without changing files.");
+    const result = await new CoreOrchestrator({
+      workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider()
+    }).planOnly("Explain src/index.ts without changing files.");
     const trace = await reconstructFactoryRunTrace({ workspacePath: workspace, runId: result.run.id });
     const eventTypes = new Set(trace.events.map((event) => event.event_type));
 
@@ -213,6 +219,7 @@ test("CoreOrchestrator emits review trace events on the existing mock execution 
   try {
     const result = await new CoreOrchestrator({
       workspacePath: workspace,
+      providerFactory: () => new ScriptedProvider(),
       maxContextFiles: 3,
       maxContextChars: 2500
     }).runAgenticTask("Explain src/index.ts and do not change files.");
@@ -238,20 +245,35 @@ test("CoreOrchestrator emits review trace events on the existing mock execution 
 test("active SwarmAutopilotRuntime emits unified trace events and preserves swarm trace artifacts", async () => {
   const workspace = await fixtureWorkspace("factory-trace-swarm");
   try {
-    const worker: SwarmWorker = async (input) => ({
-      schema_version: 1,
-      work_item_id: input.workItem.id,
-      status: "succeeded",
-      summary: `${input.agent.role} handled ${input.workItem.type}.`,
-      relevant_files: input.workItem.read_files.filter((entry) => entry.endsWith(".ts")),
-      findings: ["ok"],
-      risks: [],
-      unknowns: [],
-      validation_passed: input.workItem.type === "test" ? true : undefined,
-      structured_output_valid: true,
-      confidence: 0.9
-    });
-    const result = await new SwarmAutopilotRuntime({ workspacePath: workspace, worker }).run("Fix a small bug in src/index.ts");
+    const worker: SwarmWorker = async (input) => {
+      const frame = await new IntentHandoffGate({
+        workspacePath: workspace
+      }).swarmFrame(input.run, input.workItem);
+
+      return {
+        schema_version: 1,
+        work_item_id: input.workItem.id,
+        status: "succeeded",
+        summary: `${input.agent.role} handled ${input.workItem.type}.`,
+        relevant_files: input.workItem.read_files.filter((entry) => entry.endsWith(".ts")),
+        findings: ["ok"],
+        risks: [],
+        unknowns: [],
+        validation_passed: input.workItem.type === "test" ? true : undefined,
+        structured_output_valid: true,
+        confidence: 0.9,
+
+        intent_alignment: createAlignmentFromFrame(frame, {
+          taskUnderstanding: `${input.agent.role} handled ${input.workItem.type}.`,
+          originalGoalContribution: "This work item contributes to the requested swarm task."
+        })
+      };
+    };
+    const result = await new SwarmAutopilotRuntime({
+      workspacePath: workspace,
+      worker,
+      providerFactory: () => new ScriptedProvider()
+    }).run("Fix a small bug in src/index.ts");
     const trace = await reconstructFactoryRunTrace({ workspacePath: workspace, runId: result.run.id });
     const eventTypes = new Set(trace.events.map((event) => event.event_type));
 
