@@ -74,7 +74,11 @@ function assertSmoke(report: ReturnType<typeof createReport>) {
   assert.equal(report.evidenceReport.finalEvidenceFilesActuallyUsed.some((file) => file.includes("tmp/")), false, "tmp artifacts must not be used as final source proof");
   assert.equal(report.evidenceReport.evidenceFilesByTier.source_code.some((file) => file === "src/clustering.py"), true, "real source evidence should be used");
   assert.equal(report.evidenceReport.excludedEvidenceCandidates.some((file) => file.includes("tmp/root-cause-audit/explain-repro-results.json")), true, "generated audit artifact should be excluded");
-  assert.notEqual(report.providerTelemetry.providerMode, "demo_mock", "inspect-provider-truth smoke must not use mock/demo providers");
+  assert.equal(
+    report.providerTelemetry.providerMode,
+    "real_provider",
+    "inspect-provider-truth smoke must use the real provider runtime mode"
+  );
   assert.ok((report.providerTelemetry.realProviderRequestCount ?? 0) > 0, "inspect-provider-truth smoke must make real provider requests");
   assert.equal(report.providerTelemetry.finalResponseSource, "provider", "inspect-provider-truth smoke must finish with provider-authored output");
 }
