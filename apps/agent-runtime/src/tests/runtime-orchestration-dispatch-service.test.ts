@@ -6,7 +6,9 @@ import {
   type SimpleRuntimeDispatchOptions
 } from "../runtime/RuntimeOrchestrationDispatchService.js";
 import type { ConversationUnderstanding } from "../runtime/ConversationUnderstanding.js";
-import type { RuntimeModeResolution } from "../runtime/RuntimeOrchestrationPreludeService.js";
+import { resolveRuntimeMode, type RuntimeModeResolution } from "../runtime/RuntimeOrchestrationPreludeService.js";
+import { beginDecisionPipeline } from "../runtime/DecisionPipeline.js";
+import type { LlmProvider, LlmRequest } from "../llm/LlmProvider.js";
 
 test("runtime orchestration dispatch keeps recursive tree for unrouted orchestrated mode", async () => {
   const calls: string[] = [];
@@ -30,10 +32,23 @@ test("runtime orchestration dispatch routes provider-authored read-only swarm be
   assert.deepEqual(calls, ["provider_backed_swarm"]);
 });
 
-test("runtime orchestration dispatch routes provider-authored orchestrated runs before recursive tree", async () => {
+test("runtime orchestration dispatch routes orchestrated_run to recursive_swarm when swarmMode is recursive_tree", async () => {
   const calls: string[] = [];
   const result = await new RuntimeOrchestrationDispatchService().dispatch({
     ...input("orchestrated_mode", "recursive_tree", calls),
+    prompt: "Fix the failing multiply test in calculator.ts",
+    conversationUnderstanding: routeUnderstanding("orchestrated_run")
+  });
+
+  assert.equal(result.branch, "recursive_swarm");
+  assert.deepEqual(calls, ["recursive_swarm"]);
+});
+
+test("runtime orchestration dispatch routes orchestrated_run to provider_backed_swarm when swarmMode is pipeline", async () => {
+  const calls: string[] = [];
+  const result = await new RuntimeOrchestrationDispatchService().dispatch({
+    ...input("orchestrated_mode", "pipeline", calls),
+    prompt: "Fix the failing multiply test in calculator.ts",
     conversationUnderstanding: routeUnderstanding("orchestrated_run")
   });
 
@@ -116,6 +131,86 @@ test("runtime orchestration dispatch forwards simple run options", async () => {
   assert.equal(observed?.thinkFirst, true);
   assert.deepEqual(observed?.projectMap.importantFiles, ["package.json"]);
 });
+
+test("Axios regression: provider inspect_explain for explicit bugfix and patch reaches recursive_swarm dispatch branch when swarmMode is recursive_tree", async () => {
+  const axiosFixPrompt = [
+    "Fix the following issue in this Axios repository.",
+    "",
+    "**Unexpected default maxBodyLength enforcement by follow-redirects**",
+    "",
+    "After an upgrade of follow-redirects, Axios began enforcing a default 10 MB request-body limit, even though its default behavior was intended to be unlimited.",
+    "",
+    "Investigate and fix the issue while preserving existing behavior and explicit body-size limits.",
+    "",
+    "Generate a reviewable patch, request approval before applying changes, and verify the result."
+  ].join("\n");
+
+  const stubbedProvider: LlmProvider = {
+    async generateStructured<T>(_input: LlmRequest, schema: unknown): Promise<T> {
+      const schemaName = typeof schema === "object" && schema && "name" in schema
+        ? String((schema as { name: string }).name)
+        : "";
+      if (schemaName === "initial-reasoning-decision") {
+        return {
+          understanding: {
+            originalRequest: axiosFixPrompt,
+            cleanedRequest: "Locate and modify the Axios code that sets the default maxBodyLength (currently 10 MB after follow-redirects upgrade) so that the default is unlimited and behaves consistently regardless of maxRedirects. Produce a reviewable patch, ask for approval, then run the repository's Docker-based tests to confirm the fix.",
+            language: "english",
+            intentKind: "workspace_question",
+            route: "inspect_explain",
+            needsWorkspace: true,
+            goal: "Identify the source handling of maxBodyLength default in the Axios codebase, adjust it to make the default unlimited, create a patch, seek approval, and verify that all tests pass.",
+            ambiguities: [],
+            requiredEvidence: ["Source file(s) where maxBodyLength default is defined"],
+            risk: "medium",
+            confidence: "high",
+            rationale: "The user asks for a code change; the first step must be to investigate the existing implementation to understand where and how the default maxBodyLength is set before proposing a fix."
+          },
+          step: {
+            id: "step_1",
+            kind: "tool_batch",
+            rationale: "Investigate before modifying.",
+            toolRequests: [
+              { id: "tool_1", kind: "repository_search", reason: "Locate code", query: "maxBodyLength" }
+            ],
+            missingFacts: [],
+            successCriteria: ["Found files"]
+          }
+        } as T;
+      }
+      throw new Error(`Unexpected schema call: ${schemaName}`);
+    },
+    async generateText(): Promise<string> {
+      throw new Error("Unexpected text call");
+    }
+  };
+
+  const pipeline = await beginDecisionPipeline({
+    message: axiosFixPrompt,
+    provider: stubbedProvider
+  });
+
+  const calls: string[] = [];
+  const result = await new RuntimeOrchestrationDispatchService().dispatch({
+    sessionId: "session-axios-integration",
+    prompt: axiosFixPrompt,
+    projectMap,
+    modeResolution: resolveRuntimeMode({
+      sessionMode: "auto_mode",
+      prompt: axiosFixPrompt,
+      projectMap,
+      conversationUnderstanding: pipeline.understanding
+    }),
+    swarmMode: "recursive_tree",
+    thinkFirst: false,
+    conversationUnderstanding: pipeline.understanding,
+    branches: branches(calls)
+  });
+
+  assert.equal(result.branch, "recursive_swarm");
+  assert.deepEqual(calls, ["recursive_swarm"]);
+});
+
 
 function input(
   mode: RuntimeModeResolution["mode"],

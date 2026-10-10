@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   AgentRuntimeSession,
   CreateRuntimeSessionRequest,
   CreateRuntimeSessionResponse,
@@ -9,6 +9,7 @@
   ReportPatchApplyResultRequest,
   RuntimeTurnResponse
 } from "@hivo/protocol";
+import { randomUUID } from "node:crypto";
 import type { RuntimeConfig } from "../config.js";
 import type { LlmProvider } from "../llm/LlmProvider.js";
 import { inferActiveProviderSource } from "../llm/ProviderTelemetry.js";
@@ -115,14 +116,16 @@ export class AgentRuntime {
     this.providerBackedSwarmService = new RuntimeProviderBackedSwarmService(this.sessionManager, this.runEngineService);
     this.providerContextService = new RuntimeProviderContextService({
       providerRequestTimeoutMs: this.config.providerRequestTimeoutMs,
+      maxProviderCallsPerRun: this.config.maxProviderCallsPerRun,
+      maxRunWallClockMs: this.config.maxRunWallClockMs,
       getProvider: (session) => this.getProvider(session),
       createProvider: createRealProvider,
       useSessionProviderForSpecializedModels: Boolean(this.options.providerFactory)
     });
     this.directTurnService = new RuntimeDirectTurnService(this.sessionManager);
     this.adaptiveDirectTurnService = new RuntimeAdaptiveDirectTurnService(this.sessionManager, this.directTurnService);
-    this.recursiveSwarmService = new RuntimeRecursiveSwarmService(this.sessionManager, this.directTurnService);
     this.sessionOutcomeService = new RuntimeSessionOutcomeService(this.sessionManager);
+    this.recursiveSwarmService = new RuntimeRecursiveSwarmService(this.sessionManager, this.directTurnService, this.sessionOutcomeService);
     this.pendingActionService = new RuntimePendingActionService(this.sessionManager);
     this.approvalBoundaryService = new RuntimeApprovalBoundaryService(this.sessionManager);
     this.recursiveFactoryPlanningService = new RuntimeRecursiveFactoryPlanningService(this.sessionManager);
@@ -215,8 +218,19 @@ export class AgentRuntime {
     return { sessionId: session.id, status: "created" };
   }
 
-  async runTurn(sessionId: string, message: string): Promise<RuntimeTurnResponse> {
-    const session = this.requireSession(sessionId);
+  async runTurn(
+    sessionId: string,
+    message: string,
+    options?: { thinkFirst?: boolean }
+  ): Promise<RuntimeTurnResponse> {
+    let session = this.requireSession(sessionId);
+    const thinkFirst = options?.thinkFirst;
+    if (thinkFirst !== undefined && session.thinkFirst !== thinkFirst) {
+      await this.sessionManager.updateSession(sessionId, (draft) => {
+        draft.thinkFirst = thinkFirst;
+      });
+      session = this.requireSession(sessionId);
+    }
     const pendingAction = await this.pendingActionService.handle(session, message);
     if (pendingAction.handled) {
       return { sessionId, status: this.requireSession(sessionId).status };
@@ -330,6 +344,56 @@ export class AgentRuntime {
     }
     const afterPatch = this.requireSession(sessionId);
     if (result.status === "applied") {
+      await this.sessionManager.updateSession(sessionId, (draft) => {
+        if (draft.recursiveSwarmRunState) {
+          draft.recursiveSwarmRunState.planState = "implemented";
+          draft.recursiveSwarmRunState.updatedAt = new Date().toISOString();
+        }
+      });
+
+      const current = this.requireSession(sessionId);
+      const staged = current.recursiveSwarmRunState?.stagedValidationCommands ?? [];
+      const testCmd = current.projectIntake?.testCommands?.[0];
+      const commandsToSchedule = [...staged];
+      if (testCmd && !commandsToSchedule.some((c) => c.command.trim() === testCmd.trim())) {
+        commandsToSchedule.push({
+          id: `rs_valcmd_${randomUUID().slice(0, 8)}`,
+          sessionId,
+          command: testCmd,
+          cwd: current.workspacePath,
+          risk: "safe" as const,
+          reason: `Post-apply validation for patch ${patchId}: ${testCmd}`,
+          status: "requested" as const,
+          createdAt: new Date().toISOString()
+        });
+      }
+
+      for (const cmd of commandsToSchedule) {
+        const alreadyScheduled = current.commandRequests.some(
+          (req) => req.provenance?.approvalId === patchId ||
+            (req.command.trim() === cmd.command.trim() && (req.status === "requested" || req.status === "approved" || req.status === "executing")) ||
+            (req.id === cmd.id && (req.status === "requested" || req.status === "approved" || req.status === "executing" || req.status === "executed"))
+        );
+        if (!alreadyScheduled) {
+          const cmdId = cmd.id || `rs_valcmd_${randomUUID().slice(0, 8)}`;
+          await this.sessionManager.addCommandRequest(sessionId, {
+            ...cmd,
+            id: cmdId,
+            sessionId,
+            cwd: cmd.cwd || current.workspacePath,
+            reason: `Post-apply validation for patch ${patchId}: ${cmd.command}`,
+            provenance: {
+              source: "agent",
+              trigger: "manual",
+              reason: `Post-apply validation for patch ${patchId}`,
+              approvalId: patchId
+            },
+            status: "requested",
+            createdAt: new Date().toISOString()
+          });
+        }
+      }
+
       await this.runToGreenService.queuePendingRerun(afterPatch, patchId, "Approved repair patch applied; rerun the selected command.");
     } else {
       await this.runToGreenService.recordPatchApplyFailure(sessionId, patchId);

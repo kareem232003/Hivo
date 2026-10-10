@@ -27,8 +27,9 @@ import {
 import { UserIntentCompiler, type UserIntentCompilationResult } from "./UserIntentCompiler.js";
 import { ProjectGoalSpecStore } from "./GoalSteward.js";
 import type { IntegrationResult as FactoryIntegrationResult } from "./IntegrationModels.js";
-import { MultiPlanFactory } from "./MultiPlanFactory.js";
-import type { MergedPlan, MultiPlanFactoryResult, MultiPlanSummary } from "./MultiPlanModels.js";
+import { MultiPlanFactory, shouldUseMultiPlanFactory } from "./MultiPlanFactory.js";
+import { ProviderPlanningEvidenceBootstrapper } from "./ProviderPlanningEvidenceBootstrapper.js";
+import type { MergedPlan, MultiPlanFactoryResult, MultiPlanInput, MultiPlanSummary } from "./MultiPlanModels.js";
 import {
   ORCHESTRATION_SCHEMA_VERSION,
   type AgentInvocation,
@@ -647,7 +648,8 @@ export class CoreOrchestrator {
       commandInventory,
       relevantFiles
     });
-    return new MultiPlanFactory(this.workspacePath, this.memoryDir).create({
+
+    const multiPlanInput: MultiPlanInput = {
       run,
       rawUserRequest: run.user_request,
       taskObjective: planningRequest,
@@ -656,7 +658,30 @@ export class CoreOrchestrator {
       staffingPlan,
       config: this.config,
       planOnly
-    });
+    };
+    if (
+      this.config.enable_multi_plan_factory &&
+      this.config.use_planning_evidence &&
+      this.config.planning_evidence_mode !== "off" &&
+      shouldUseMultiPlanFactory(multiPlanInput).use_multi_plan
+    ) {
+      const planningProvider = this.providerFactory?.("PlannerAgent");
+      if (planningProvider) {
+        await new ProviderPlanningEvidenceBootstrapper({
+          workspacePath: this.workspacePath,
+          memoryDir: this.memoryDir
+        }).ensurePlanningEvidence({
+          run,
+          planningRequest,
+          repoIndex,
+          commandInventory,
+          provider: planningProvider,
+          planOnly
+        });
+      }
+    }
+
+    return new MultiPlanFactory(this.workspacePath, this.memoryDir).create(multiPlanInput);
   }
 
   private async invokeRole(run: Run, task: Task): Promise<ParsedAgentOutput> {

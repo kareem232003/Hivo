@@ -6,9 +6,15 @@ import type {
   SplitSubTask,
   MemoryEvidencePack,
   RecursiveSwarmNode,
-  RecursiveSwarmRunOptions
+  RecursiveSwarmRunOptions,
+  WorkerResponsibility
 } from "./RecursiveSwarmModels.js";
-import { DEFAULT_COMPLEXITY_THRESHOLD } from "./RecursiveSwarmModels.js";
+import {
+  DEFAULT_COMPLEXITY_THRESHOLD,
+  classifyWorkerResponsibility,
+  extractLocalTaskObjective,
+  isImplementationGoal
+} from "./RecursiveSwarmModels.js";
 
 export type RecursiveTaskSplitterOptions = {
   provider?: LlmProvider;
@@ -21,10 +27,17 @@ Your job is to split a complex task into smaller, independent sub-tasks that can
 Each sub-task should:
 - Be small enough to be handled by a single agent
 - Have a clear, unambiguous objective
-- Specify its expected output
+- Specify its expected output as ONE single deliverable
+- Declare an explicit responsibility: "INSPECT", "IMPLEMENT", "VERIFY", or "INTEGRATE"
 - Declare dependencies on other sub-tasks (by index)
+- For implementation tasks requiring verified source, declare sourceEvidenceRequirement with the prerequisite sub-task ID, workspace-relative source path (or the prerequisite artifact name that will specify it), and evidenceType "verified_workspace_source". Never write natural-language placeholders like "<to be filled>".
 - Preserve the original user goal and deliverable contract
 - Produce a concrete artifact, patch intent, validation result, review decision, evidence report, or merge decision
+
+CRITICAL CONSTRAINTS:
+- Single Deliverable Protocol: Each sub-task must produce exactly ONE structured deliverable. Never ask a single sub-task to produce multiple top-level artifacts (e.g., do NOT ask for both code_patch.diff and commit_message.txt).
+- No Direct Mutation or Commit Authority: Sub-tasks only propose changes. Never ask sub-tasks or workers to directly apply patches, run git apply, or execute git commit. The approved runtime and Tauri/Rust pipeline owns all workspace mutation and Git commands.
+- Diagnostic vs Implementation: A diagnostic/inspection child (e.g. running tests, investigating errors, gathering evidence) has responsibility "INSPECT" and must not be asked to return code patches. An implementation child has responsibility "IMPLEMENT" and must return a concrete code deliverable.
 
 Do not split just to retrieve/search/check again unless that child has a concrete output.
 Respond with JSON:
@@ -32,7 +45,7 @@ Respond with JSON:
   "shouldSplit": boolean,
   "desiredChildCount": number,
   "splitReason": string,
-  "subTasks": [{ "title": string, "taskPrompt": string, "expectedOutput": string, "dependencies": string[], "canWrite": boolean, "acceptanceCriteria": string[] }],
+  "subTasks": [{ "id": string, "title": string, "taskPrompt": string, "expectedOutput": string, "dependencies": string[], "sourceEvidenceRequirement"?: { "prerequisiteSubtaskId": string, "sourcePath": string, "evidenceType": "verified_workspace_source" }, "canWrite": boolean, "responsibility": "INSPECT" | "IMPLEMENT" | "VERIFY" | "INTEGRATE", "acceptanceCriteria": string[] }],
   "stopConditions": string[],
   "rationale": string
 }`;
@@ -78,6 +91,7 @@ RUN BUDGET:
 Each sub-task must include the original goal context so agents don't lose sight of the objective.
 Use "dependencies" to reference other sub-tasks by their index (e.g., ["0"] means depends on first sub-task).
 Leave dependencies empty [] for tasks that can run in parallel.
+When a sourceEvidenceRequirement is present, provide stable "id" values for the referenced prerequisite and dependent sub-tasks; prerequisiteSubtaskId must match the prerequisite's id.
 For single-file games or generated artifacts, include final assembly and validation tasks rather than many vague exploratory tasks.`,
           responseFormat: "json",
           maxOutputTokens: 4096
@@ -98,11 +112,23 @@ For single-file games or generated artifacts, include final assembly and validat
                 additionalProperties: false,
                 required: ["title", "taskPrompt", "expectedOutput", "dependencies"],
                 properties: {
+                  id: { type: "string" },
                   title: { type: "string" },
                   taskPrompt: { type: "string" },
                   expectedOutput: { type: "string" },
                   dependencies: { type: "array", items: { type: "string" } },
+                  sourceEvidenceRequirement: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["prerequisiteSubtaskId", "sourcePath", "evidenceType"],
+                    properties: {
+                      prerequisiteSubtaskId: { type: "string" },
+                      sourcePath: { type: "string" },
+                      evidenceType: { type: "string", enum: ["verified_workspace_source"] }
+                    }
+                  },
                   canWrite: { type: "boolean" },
+                  responsibility: { type: "string", enum: ["INSPECT", "IMPLEMENT", "VERIFY", "INTEGRATE"] },
                   acceptanceCriteria: { type: "array", items: { type: "string" } }
                 }
               }
@@ -117,31 +143,79 @@ For single-file games or generated artifacts, include final assembly and validat
         ? JSON.parse(response)
         : response;
 
+      const rootRequiresImplementation = isImplementationGoal(node.goalEnvelope.originalGoal);
+
       const subTasks: SplitSubTask[] = (Array.isArray(parsed.subTasks) ? parsed.subTasks : []).map(
-        (sub: Record<string, unknown>, index: number) => ({
-          id: `subtask_${randomUUID().slice(0, 8)}`,
-          title: String(sub.title ?? `Sub-task ${index + 1}`),
-          taskPrompt: buildChildTaskPrompt({
-            originalGoal: node.goalEnvelope.originalGoal,
-            expandedGoal: node.goalEnvelope.expandedGoal ?? node.goalEnvelope.originalGoal,
-            deliverableContract: node.goalEnvelope.expandedGoalSpec?.deliverableContract ?? "",
-            parentTask: node.taskPrompt,
-            childTask: String(sub.taskPrompt ?? sub.title ?? ""),
-            expectedOutput: String(sub.expectedOutput ?? "Completed work"),
+        (sub: Record<string, unknown>, index: number) => {
+          const rawChildPrompt = String(sub.taskPrompt ?? sub.title ?? "");
+          const title = String(sub.title ?? `Sub-task ${index + 1}`);
+          const expectedOutput = String(sub.expectedOutput ?? "Completed work");
+          const canWrite = sub.canWrite === true;
+          const explicitResp = typeof sub.responsibility === "string" && ["INSPECT", "IMPLEMENT", "VERIFY", "INTEGRATE"].includes(sub.responsibility)
+            ? (sub.responsibility as WorkerResponsibility)
+            : undefined;
+
+          const responsibility = classifyWorkerResponsibility({
+            title,
+            localObjective: extractLocalTaskObjective(rawChildPrompt, title),
+            expectedOutput,
+            canWrite,
+            parentResponsibility: node.contract?.responsibility,
+            isRootGoalImplementation: rootRequiresImplementation,
+            explicitResponsibility: explicitResp
+          });
+
+          return {
+            id: typeof sub.id === "string" && sub.id.length > 0
+              ? sub.id
+              : `subtask_${randomUUID().slice(0, 8)}`,
+            title,
+            taskPrompt: buildChildTaskPrompt({
+              originalGoal: node.goalEnvelope.originalGoal,
+              expandedGoal: node.goalEnvelope.expandedGoal ?? node.goalEnvelope.originalGoal,
+              deliverableContract: node.goalEnvelope.expandedGoalSpec?.deliverableContract ?? "",
+              parentTask: node.taskPrompt,
+              childTask: rawChildPrompt,
+              expectedOutput,
+              acceptanceCriteria: Array.isArray(sub.acceptanceCriteria)
+                ? sub.acceptanceCriteria.map((item: unknown) => String(item))
+                : []
+            }),
+            expectedOutput,
+            dependencies: Array.isArray(sub.dependencies)
+              ? sub.dependencies.map((dep: unknown) => String(dep))
+              : [],
+            sourceEvidenceRequirement: isSourceEvidenceRequirement(sub.sourceEvidenceRequirement)
+              ? sub.sourceEvidenceRequirement
+              : undefined,
+            canWrite: responsibility === "IMPLEMENT" ? true : canWrite,
+            responsibility,
             acceptanceCriteria: Array.isArray(sub.acceptanceCriteria)
               ? sub.acceptanceCriteria.map((item: unknown) => String(item))
               : []
-          }),
-          expectedOutput: String(sub.expectedOutput ?? "Completed work"),
-          dependencies: Array.isArray(sub.dependencies)
-            ? sub.dependencies.map((dep: unknown) => String(dep))
-            : [],
-          canWrite: sub.canWrite === true,
-          acceptanceCriteria: Array.isArray(sub.acceptanceCriteria)
-            ? sub.acceptanceCriteria.map((item: unknown) => String(item))
-            : []
-        })
+          };
+        }
       );
+
+      // Root implementation obligation check:
+      // If root goal requires implementation and this node is root (or an IMPLEMENT parent),
+      // ensure at least one child preserves IMPLEMENT responsibility.
+      if (rootRequiresImplementation && subTasks.length > 0 && (node.kind === "root" || node.contract?.responsibility === "IMPLEMENT")) {
+        const hasImplementTask = subTasks.some((st) => st.responsibility === "IMPLEMENT");
+        if (!hasImplementTask) {
+          let targetIdx = subTasks.findIndex((st) =>
+            /\b(fix|edit|modify|patch|repair|write|code|change|implement)\b/i.test(`${st.title} ${st.expectedOutput}`)
+          );
+          if (targetIdx === -1) {
+            const nonVerifyIdx = subTasks.map((st, i) => ({ st, i })).reverse().find(({ st }) => st.responsibility !== "VERIFY")?.i;
+            targetIdx = nonVerifyIdx ?? subTasks.length - 1;
+          }
+          if (targetIdx >= 0 && targetIdx < subTasks.length) {
+            subTasks[targetIdx].responsibility = "IMPLEMENT";
+            subTasks[targetIdx].canWrite = true;
+          }
+        }
+      }
 
       return {
         subTasks,
@@ -167,6 +241,16 @@ For single-file games or generated artifacts, include final assembly and validat
     return lines.join("\n");
   }
 
+}
+
+function isSourceEvidenceRequirement(value: unknown): value is NonNullable<SplitSubTask["sourceEvidenceRequirement"]> {
+  if (!value || typeof value !== "object") return false;
+  const requirement = value as Record<string, unknown>;
+  return typeof requirement.prerequisiteSubtaskId === "string"
+    && requirement.prerequisiteSubtaskId.length > 0
+    && typeof requirement.sourcePath === "string"
+    && requirement.sourcePath.length > 0
+    && requirement.evidenceType === "verified_workspace_source";
 }
 
 function buildChildTaskPrompt(input: {

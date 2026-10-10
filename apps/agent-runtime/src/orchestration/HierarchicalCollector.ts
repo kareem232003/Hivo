@@ -43,7 +43,13 @@ export class HierarchicalCollector {
       if (child.structuredOutput) {
         this.collectTypedOutput(child.structuredOutput, evidenceReports, generatedArtifacts, editIntents, validationPlans);
       }
-      if (child.outputSummary) {
+      if (child.structuredOutput?.kind === "generated_artifact") {
+        const artifact = child.structuredOutput;
+        const excerpt = artifact.content.length > 500 ? artifact.content.slice(0, 500) + "... [truncated]" : artifact.content;
+        childResults[child.id] = child.outputSummary
+          ? `${child.outputSummary}\nArtifact Content (${artifact.path}):\n${excerpt}`
+          : `Artifact (${artifact.path}):\n${excerpt}`;
+      } else if (child.outputSummary) {
         childResults[child.id] = child.outputSummary;
       }
       if (child.errorSummary) {
@@ -169,7 +175,10 @@ export class HierarchicalCollector {
       findings.push(...er.findings);
     }
     for (const artifact of generatedArtifacts) {
-      findings.push(`Generated artifact: ${artifact.path} (${artifact.content.length} character(s)) - ${artifact.description.slice(0, 160)}`);
+      const contentSnippet = artifact.content.length <= 200
+        ? ` content: "${artifact.content.trim()}"`
+        : ` excerpt: "${artifact.content.trim().slice(0, 200)}..."`;
+      findings.push(`Generated artifact: ${artifact.path} (${artifact.content.length} character(s))${contentSnippet} - ${artifact.description.slice(0, 160)}`);
     }
     for (const ei of editIntents) {
       findings.push(`Edit intent: ${ei.operation} ${ei.target_file} (${ei.risk} risk) — ${ei.reason.slice(0, 120)}`);

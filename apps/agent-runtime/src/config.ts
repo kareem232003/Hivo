@@ -6,6 +6,8 @@ export type RuntimeConfig = {
   storageDir: string;
   defaultMode: "real_provider";
   providerRequestTimeoutMs: number;
+  maxProviderCallsPerRun: number;
+  maxRunWallClockMs: number;
   openaiApiKey?: string;
   openaiBaseUrl: string;
   agenticTaskKernelEnabled: boolean;
@@ -29,6 +31,8 @@ export function loadConfig(): RuntimeConfig {
     storageDir: process.env.HIVO_AGENT_STORAGE ?? process.env.ORCHCODE_AGENT_STORAGE ?? resolveDefaultStorageDir(),
     defaultMode: "real_provider",
     providerRequestTimeoutMs: intEnv("HIVO_PROVIDER_TIMEOUT_MS", intEnv("ORCHCODE_PROVIDER_TIMEOUT_MS", 600_000)),
+    maxProviderCallsPerRun: intEnv("HIVO_RUN_MAX_PROVIDER_CALLS", 24),
+    maxRunWallClockMs: intEnv("HIVO_RUN_MAX_WALL_CLOCK_MS", 1_200_000),
     openaiApiKey: process.env.OPENAI_API_KEY,
     openaiBaseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com",
     agenticTaskKernelEnabled: boolEnv("HIVO_AGENTIC_TASK_KERNEL_ENABLED", true),

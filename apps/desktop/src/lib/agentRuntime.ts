@@ -113,11 +113,16 @@ export async function createRuntimeSession(input: {
   });
 }
 
-export async function runRuntimeTurn(sessionId: string, message: string, sessionToken?: string) {
+export async function runRuntimeTurn(
+  sessionId: string,
+  message: string,
+  sessionToken?: string,
+  options?: { thinkFirst?: boolean }
+) {
   await assertRuntimeAvailable();
   return runtimeFetch<RuntimeTurnResponse>(`/sessions/${sessionId}/turn`, {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, thinkFirst: options?.thinkFirst }),
     sessionToken
   });
 }

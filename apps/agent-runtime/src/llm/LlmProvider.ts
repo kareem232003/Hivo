@@ -1,5 +1,7 @@
 import type { ProviderPipelineStage, ReasoningStage } from "@hivo/protocol";
 
+import { performance } from "node:perf_hooks";
+
 export type LlmRequest = {
   systemPrompt: string;
   userPrompt: string;
@@ -11,12 +13,51 @@ export type LlmRequest = {
   maxContextChars?: number;
   responseFormat?: "json";
   structuredSchema?: unknown;
+  providerRunBudget?: ProviderRunBudget;
 };
 
 export type EmbeddingRequest = {
   inputs: string[];
   model?: string;
+  timeoutMs?: number;
+  providerRunBudget?: ProviderRunBudget;
 };
+
+export class ProviderRunBudget {
+  private usedCalls = 0;
+  private readonly startedAt = performance.now();
+
+  constructor(
+    readonly maxCalls: number,
+    readonly maxElapsedMs: number
+  ) {}
+
+  reserveCall(): number {
+    const remainingMs = this.assertAvailable();
+    this.usedCalls += 1;
+    return remainingMs;
+  }
+
+  assertAvailable(): number {
+    const remainingMs = this.remainingMs();
+    if (this.usedCalls >= this.maxCalls) {
+      throw new Error(`provider_budget_exhausted:model_calls:${this.maxCalls}`);
+    }
+    return remainingMs;
+  }
+
+  remainingMs(): number {
+    const remainingMs = this.maxElapsedMs - (performance.now() - this.startedAt);
+    if (remainingMs <= 0) {
+      throw new Error(`provider_budget_exhausted:wall_clock:${this.maxElapsedMs}`);
+    }
+    return remainingMs;
+  }
+
+  get callCount() {
+    return this.usedCalls;
+  }
+}
 
 export type EmbeddingResponse = {
   model: string;

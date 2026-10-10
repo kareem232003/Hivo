@@ -1,11 +1,17 @@
 use crate::models::{
-    BackgroundJobRecord, CommandExecutionProvenance, CommandFailureDiagnosis, CommandResult, CommandRisk,
-    SafetySettingsInput,
+    BackgroundJobRecord, CommandExecutionProvenance, CommandFailureDiagnosis, CommandResult,
+    CommandRisk, SafetySettingsInput,
 };
 use crate::services::command_policy::{CommandPolicyAnalysis, CommandPolicyService};
 use chrono::Utc;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::{io, io::Read};
+
+const FOREGROUND_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct TerminalService;
 
@@ -20,6 +26,17 @@ impl TerminalService {
         cwd: &Path,
         workspace: &Path,
         safety: Option<SafetySettingsInput>,
+    ) -> CommandResult {
+        self.run_command_with_timeout(command, cwd, workspace, safety, FOREGROUND_COMMAND_TIMEOUT)
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        command: &str,
+        cwd: &Path,
+        workspace: &Path,
+        safety: Option<SafetySettingsInput>,
+        foreground_timeout: Duration,
     ) -> CommandResult {
         let safety = safety.unwrap_or(SafetySettingsInput {
             block_dangerous_commands: true,
@@ -89,7 +106,10 @@ impl TerminalService {
                     category: "policy_blocked".to_string(),
                     severity: "error".to_string(),
                     summary: "This command was blocked by policy before execution.".to_string(),
-                    next_step: Some("Use a safe foreground command or explicitly approve a narrower operation.".to_string()),
+                    next_step: Some(
+                        "Use a safe foreground command or explicitly approve a narrower operation."
+                            .to_string(),
+                    ),
                 }),
                 provenance: Some(build_provenance(
                     command,
@@ -120,7 +140,9 @@ impl TerminalService {
         let medium_needs_approval = risk == CommandRisk::Medium && !auto_run_medium;
         let background_needs_approval = background_detected && !auto_run_background;
         let network_needs_approval = network_detected && !auto_run_network;
-        if !approval_granted && (medium_needs_approval || background_needs_approval || network_needs_approval) {
+        if !approval_granted
+            && (medium_needs_approval || background_needs_approval || network_needs_approval)
+        {
             return CommandResult {
                 command: command.to_string(),
                 cwd: cwd.to_string_lossy().to_string(),
@@ -274,50 +296,59 @@ impl TerminalService {
             };
         }
 
-        let output = if cfg!(windows) {
-            Command::new("cmd")
-                .args(["/C", command])
-                .current_dir(&canonical_cwd)
-                .output()
-        } else {
-            Command::new("sh")
-                .args(["-lc", command])
-                .current_dir(&canonical_cwd)
-                .output()
-        };
+        let output = run_foreground_command(command, &canonical_cwd, foreground_timeout);
 
         match output {
             Ok(output) => CommandResult {
                 command: command.to_string(),
                 cwd: cwd.to_string_lossy().to_string(),
                 risk,
-                status: if output.status.success() {
+                status: if output.timed_out {
+                    "timed_out"
+                } else if output.status.success() {
                     "executed"
                 } else {
                     "failed"
                 }
                 .to_string(),
-                exit_code: output.status.code(),
+                exit_code: if output.timed_out {
+                    None
+                } else {
+                    output.status.code()
+                },
                 stdout: maybe_redact(
                     String::from_utf8_lossy(&output.stdout).to_string(),
                     safety.redact_secrets,
                 ),
-                stderr: maybe_redact(
-                    String::from_utf8_lossy(&output.stderr).to_string(),
-                    safety.redact_secrets,
-                ),
-                message: Some(command_result_message(
-                    command,
-                    output.status.code(),
-                    &String::from_utf8_lossy(&output.stdout),
-                    &String::from_utf8_lossy(&output.stderr),
-                )),
-                diagnosis: diagnose_command_failure(
-                    command,
-                    output.status.code(),
-                    &String::from_utf8_lossy(&output.stdout),
-                    &String::from_utf8_lossy(&output.stderr),
-                ),
+                stderr: maybe_redact(String::from_utf8_lossy(&output.stderr).to_string(), safety.redact_secrets),
+                message: Some(if output.timed_out {
+                    format!(
+                        "Foreground command exceeded the {} second timeout and was terminated.",
+                        foreground_timeout.as_secs()
+                    )
+                } else {
+                    command_result_message(
+                        command,
+                        output.status.code(),
+                        &String::from_utf8_lossy(&output.stdout),
+                        &String::from_utf8_lossy(&output.stderr),
+                    )
+                }),
+                diagnosis: if output.timed_out {
+                    Some(CommandFailureDiagnosis {
+                        category: "timeout".to_string(),
+                        severity: "error".to_string(),
+                        summary: "The foreground command exceeded its execution timeout.".to_string(),
+                        next_step: Some("Inspect the command and retry only with a bounded verification step.".to_string()),
+                    })
+                } else {
+                    diagnose_command_failure(
+                        command,
+                        output.status.code(),
+                        &String::from_utf8_lossy(&output.stdout),
+                        &String::from_utf8_lossy(&output.stderr),
+                    )
+                },
                 provenance: Some(build_provenance(
                     command,
                     cwd,
@@ -325,7 +356,9 @@ impl TerminalService {
                     approval_granted,
                     false,
                     None,
-                    Some(if output.status.success() {
+                    Some(if output.timed_out {
+                        "Foreground command was terminated after reaching the execution timeout.".to_string()
+                    } else if output.status.success() {
                         "Foreground command completed under Rust authority.".to_string()
                     } else {
                         "Foreground command failed under Rust authority.".to_string()
@@ -361,6 +394,107 @@ impl TerminalService {
             },
         }
     }
+}
+
+struct ForegroundCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+fn run_foreground_command(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::io::Result<ForegroundCommandOutput> {
+    let mut command_builder = if cfg!(windows) {
+        let mut builder = Command::new("cmd");
+        builder.args(["/C", command]);
+        builder
+    } else {
+        let mut builder = Command::new("sh");
+        builder.args(["-lc", command]);
+        builder
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command_builder.process_group(0);
+    }
+
+    let mut child = command_builder
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout was configured as piped");
+    let stderr = child.stderr.take().expect("stderr was configured as piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::BufReader::new(stdout).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::BufReader::new(stderr).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let started = Instant::now();
+    let mut timed_out = false;
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            terminate_process_tree(&mut child)?;
+            break child.wait()?;
+        }
+        thread::sleep(COMMAND_TIMEOUT_POLL_INTERVAL);
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout reader thread panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stderr reader thread panicked"))??;
+
+    Ok(ForegroundCommandOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let terminated = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())?;
+
+    #[cfg(unix)]
+    let terminated = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())?;
+
+    if !terminated {
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+        }
+    }
+    Ok(())
 }
 
 fn blocked_result(
@@ -450,15 +584,17 @@ fn build_provenance(
         } else {
             "system".to_string()
         }),
-        approval_source: Some(match policy.policy_decision {
-            "deny" => "denied",
-            "require_approval" if approval_granted => "manual",
-            "require_approval" => "none",
-            "allow" if approval_granted => "manual",
-            "allow" => "policy",
-            _ => "unknown",
-        }
-        .to_string()),
+        approval_source: Some(
+            match policy.policy_decision {
+                "deny" => "denied",
+                "require_approval" if approval_granted => "manual",
+                "require_approval" => "none",
+                "allow" if approval_granted => "manual",
+                "allow" => "policy",
+                _ => "unknown",
+            }
+            .to_string(),
+        ),
         policy_decision: Some(policy.policy_decision.to_string()),
         policy_reason: Some(policy.policy_reason.clone()),
         execution_authority: Some("rust".to_string()),
@@ -500,7 +636,12 @@ fn approval_required_message(command: &str) -> String {
     detail
 }
 
-fn command_result_message(command: &str, exit_code: Option<i32>, stdout: &str, stderr: &str) -> String {
+fn command_result_message(
+    command: &str,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
     if let Some(diagnosis) = diagnose_command_failure(command, exit_code, stdout, stderr) {
         return diagnosis.summary;
     }
@@ -528,7 +669,10 @@ fn diagnose_command_failure(
 
     let combined = format!("{stdout}\n{stderr}");
     let normalized = combined.to_ascii_lowercase();
-    if command.trim().to_ascii_lowercase().starts_with("git status")
+    if command
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("git status")
         && exit_code.unwrap_or(1) != 0
         && normalized.contains("not a git repository")
     {
@@ -549,7 +693,9 @@ fn diagnose_command_failure(
             category: "command_not_found".to_string(),
             severity: "error".to_string(),
             summary: "The requested executable was not found in this environment.".to_string(),
-            next_step: Some("Check the command name, PATH, or project scripts before retrying.".to_string()),
+            next_step: Some(
+                "Check the command name, PATH, or project scripts before retrying.".to_string(),
+            ),
         });
     }
 
@@ -633,7 +779,49 @@ mod tests {
     use crate::models::SafetySettingsInput;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn foreground_command_is_terminated_at_its_timeout() {
+        let workspace = temp_workspace();
+        let started = Instant::now();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 > nul"
+        } else {
+            "sleep 5"
+        };
+        let result = TerminalService::new().run_command_with_timeout(
+            command,
+            &workspace,
+            &workspace,
+            Some(SafetySettingsInput {
+                block_dangerous_commands: true,
+                redact_secrets: true,
+                allow_network_commands: true,
+                auto_run_medium_commands: Some(true),
+                auto_run_background_commands: Some(true),
+                auto_run_network_commands: Some(true),
+                approval_granted: Some(true),
+            }),
+            Duration::from_millis(150),
+        );
+
+        assert_eq!(result.status, "timed_out");
+        assert_eq!(
+            result
+                .diagnosis
+                .as_ref()
+                .map(|diagnosis| diagnosis.category.as_str()),
+            Some("timeout")
+        );
+        assert!(result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("terminated"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = fs::remove_dir_all(&workspace);
+    }
 
     #[test]
     fn policy_classified_allowed_command_includes_provenance() {
@@ -763,11 +951,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hivo-terminal-{}-{}",
-            std::process::id(),
-            unique
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hivo-terminal-{}-{}", std::process::id(), unique));
         fs::create_dir_all(&path).expect("workspace");
         path
     }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,6 +51,24 @@ test("RuntimeApprovalBoundaryService approves patches and records Rust apply ack
     assert.equal(session.artifacts.some((artifact) => artifact.type === "summary" && /Patch applied/.test(artifact.title)), true);
     assert.match(session.messages.at(-1)?.content ?? "", /Rust applied the patch/);
     assert.equal(session.orchestration?.agentRuns[0]?.workJournal?.some((entry) => entry.title === "Patch apply acknowledged"), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("RuntimeApprovalBoundaryService records rejection without applying the proposal", async () => {
+  const fixture = await approvalFixture();
+  try {
+    const service = new RuntimeApprovalBoundaryService(fixture.manager);
+    const rejected = await service.rejectPatch(fixture.sessionId, fixture.patchId);
+
+    assert.equal(rejected.applied, false);
+    assert.equal(rejected.proposal.status, "rejected");
+    const session = fixture.manager.getSession(fixture.sessionId)!;
+    assert.equal(session.patchProposals[0]?.status, "rejected");
+    assert.equal(session.lifecycleStage, "BLOCKED");
+    assert.equal(session.orchestration?.approvalDecisions[0]?.decision, "rejected");
+    assert.equal(await readFile(path.join(fixture.workspace, "src", "a.ts"), "utf8"), "old\n");
   } finally {
     await fixture.cleanup();
   }

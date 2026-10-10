@@ -78,35 +78,67 @@ function lineCountInDiff(diff: string): number {
 
 // ── Unified diff builder ────────────────────────────────────
 
+function splitFileLines(content: string): string[] {
+  let normalized = content;
+  if (normalized.endsWith("\r\n")) {
+    normalized = normalized.slice(0, -2);
+  } else if (normalized.endsWith("\n")) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized.length > 0 ? normalized.split(/\r?\n/) : [];
+}
+
 function buildUnifiedDiff(
   filePath: string,
+  fileLines: string[],
   oldLines: string[],
   newLines: string[],
-  startLine: number,
+  matchIdx: number,
   contextLines = 3
 ): string {
-  const oldBlock = oldLines.slice(Math.max(0, startLine - contextLines), startLine + oldLines.length + contextLines);
-  const newBlock = newLines.slice(Math.max(0, startLine - contextLines), startLine + newLines.length + contextLines);
-  const oldStart = Math.max(1, startLine - contextLines + 1);
-  const newStart = oldStart;
+  let commonLeading = 0;
+  while (
+    commonLeading < oldLines.length &&
+    commonLeading < newLines.length &&
+    oldLines[commonLeading] === newLines[commonLeading]
+  ) {
+    commonLeading++;
+  }
+
+  let commonTrailing = 0;
+  while (
+    commonTrailing < (oldLines.length - commonLeading) &&
+    commonTrailing < (newLines.length - commonLeading) &&
+    oldLines[oldLines.length - 1 - commonTrailing] === newLines[newLines.length - 1 - commonTrailing]
+  ) {
+    commonTrailing++;
+  }
+
+  const coreOld = oldLines.slice(commonLeading, oldLines.length - commonTrailing);
+  const coreNew = newLines.slice(commonLeading, newLines.length - commonTrailing);
+  const coreStartIdx = matchIdx + commonLeading;
+  const coreEndIdx = matchIdx + oldLines.length - commonTrailing;
+
+  const preStart = Math.max(0, Math.min(matchIdx, coreStartIdx - contextLines));
+  const postEnd = Math.min(fileLines.length, Math.max(matchIdx + oldLines.length, coreEndIdx + contextLines));
+
+  const preContext = fileLines.slice(preStart, coreStartIdx);
+  const postContext = fileLines.slice(coreEndIdx, postEnd);
+
+  const oldStart = fileLines.length === 0 ? 0 : preStart + 1;
+  const oldCount = preContext.length + coreOld.length + postContext.length;
+  const newStart = fileLines.length === 0 ? (newLines.length === 0 ? 0 : 1) : preStart + 1;
+  const newCount = preContext.length + coreNew.length + postContext.length;
 
   const lines: string[] = [];
+  lines.push(`diff --git a/${filePath} b/${filePath}`);
   lines.push(`--- a/${filePath}`);
   lines.push(`+++ b/${filePath}`);
-  lines.push(`@@ -${oldStart},${oldBlock.length} +${newStart},${newBlock.length} @@`);
+  lines.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
 
-  // Context before the change
-  const preContext = oldLines.slice(Math.max(0, startLine - contextLines), startLine);
   for (const l of preContext) lines.push(` ${l}`);
-
-  // Removed lines
-  for (const l of oldLines) lines.push(`-${l}`);
-
-  // Added lines
-  for (const l of newLines) lines.push(`+${l}`);
-
-  // Context after the change
-  const postContext = oldLines.slice(startLine + oldLines.length, startLine + oldLines.length + contextLines);
+  for (const l of coreOld) lines.push(`-${l}`);
+  for (const l of coreNew) lines.push(`+${l}`);
   for (const l of postContext) lines.push(` ${l}`);
 
   return lines.join("\n") + "\n";
@@ -120,9 +152,9 @@ function tryExactReplacement(
   const { editIntent, currentFileContent, exactOldText, replacementText } = input;
   if (!exactOldText || replacementText === undefined) return null;
 
-  const fileLines = currentFileContent.split("\n");
-  const oldLines = exactOldText.split("\n");
-  const newLines = replacementText.split("\n");
+  const fileLines = splitFileLines(currentFileContent);
+  const oldLines = exactOldText.split(/\r?\n/);
+  const newLines = replacementText.split(/\r?\n/);
 
   if (oldLines.length === 0) return null;
 
@@ -140,9 +172,7 @@ function tryExactReplacement(
   const totalChanged = countLines(replacementText);
   if (totalChanged > MAX_DIFF_LINES) return null;
 
-  const newFileLines = [...fileLines];
-  newFileLines.splice(matchIdx, oldLines.length, ...newLines);
-  const diff = buildUnifiedDiff(editIntent.target_file, oldLines, newLines, matchIdx);
+  const diff = buildUnifiedDiff(editIntent.target_file, fileLines, oldLines, newLines, matchIdx);
   const summary = `Exact replacement in ${editIntent.target_file}:${matchIdx + 1}`;
 
   return {
@@ -166,8 +196,8 @@ function tryAnchorInsert(
   if (!anchorLine || !replacementText) return null;
   if (!insertAfterAnchor && !insertBeforeAnchor) return null;
 
-  const fileLines = currentFileContent.split("\n");
-  const newLines = replacementText.split("\n");
+  const fileLines = splitFileLines(currentFileContent);
+  const newLines = replacementText.split(/\r?\n/);
   if (newLines.length > MAX_DIFF_LINES) return null;
 
   // Find anchor line
@@ -181,10 +211,8 @@ function tryAnchorInsert(
     insertIdx = anchorIdx;
   }
 
-  const newFileLines = [...fileLines];
-  newFileLines.splice(insertIdx, 0, ...newLines);
   const oldBlock: string[] = [];
-  const diff = buildUnifiedDiff(editIntent.target_file, oldBlock, newLines, insertIdx);
+  const diff = buildUnifiedDiff(editIntent.target_file, fileLines, oldBlock, newLines, insertIdx);
 
   return {
     status: "real_diff",
@@ -215,6 +243,8 @@ function tryNewFileCreate(
 
   // Unified diff for a new file: /dev/null → a/file
   const diff = [
+    `diff --git a/${editIntent.target_file} b/${editIntent.target_file}`,
+    `new file mode 100644`,
     `--- /dev/null`,
     `+++ b/${editIntent.target_file}`,
     `@@ -0,0 +1,${newLines.length} @@`,
@@ -253,6 +283,8 @@ function tryFileDelete(
   }
 
   const diff = [
+    `diff --git a/${editIntent.target_file} b/${editIntent.target_file}`,
+    `deleted file mode 100644`,
     `--- a/${editIntent.target_file}`,
     `+++ /dev/null`,
     `@@ -1,${fileLines.length} +0,0 @@`,
@@ -416,7 +448,7 @@ export function buildSurgicalPatch(input: SurgicalPatchInput): SurgicalPatchBuil
   }
 
   // 3. Evidence/risk check
-  const hasEvidence = editIntent.evidence_refs.length > 0 || (evidencePack?.evidence_refs?.length ?? 0) > 0;
+  const hasEvidence = (editIntent.evidence_refs?.length ?? 0) > 0 || (evidencePack?.evidence_refs?.length ?? 0) > 0;
   if (!hasEvidence && (editIntent.risk === "medium" || editIntent.risk === "high")) {
     return {
       status: "needs_patch_generation",

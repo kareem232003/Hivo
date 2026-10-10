@@ -20,7 +20,10 @@ export class OllamaProvider implements LlmProvider {
     const maxAttempts = 3;
     let lastError = "";
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (attempt > 0) await sleep(Math.min(1000 * 2 ** attempt, 8_000));
+      if (attempt > 0) {
+        await waitForRetry(input, Math.min(1000 * 2 ** attempt, 8_000));
+        input.providerRunBudget?.reserveCall();
+      }
       let text: string;
       try {
         text = await this.generateText({
@@ -65,7 +68,10 @@ export class OllamaProvider implements LlmProvider {
   async generateText(input: LlmRequest): Promise<string> {
     const maxRetries = 2;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      if (attempt > 0) await sleep(Math.min(1000 * 2 ** attempt, 8_000));
+      if (attempt > 0) {
+        await waitForRetry(input, Math.min(1000 * 2 ** attempt, 8_000));
+        input.providerRunBudget?.reserveCall();
+      }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs(input));
       try {
@@ -127,14 +133,15 @@ export class OllamaProvider implements LlmProvider {
   }
 
   private requestTimeoutMs(input: LlmRequest) {
-    return Math.max(this.timeoutMs, input.timeoutMs ?? this.timeoutMs);
+    if (!input.providerRunBudget) return Math.max(this.timeoutMs, input.timeoutMs ?? this.timeoutMs);
+    return Math.min(this.timeoutMs, input.timeoutMs ?? this.timeoutMs, input.providerRunBudget.remainingMs());
   }
 
   async embed(input: EmbeddingRequest): Promise<EmbeddingResponse> {
     const model = input.model ?? this.embeddingModel;
     if (!model) throw new Error("real_provider.embedding_model_missing");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, input.timeoutMs ?? this.timeoutMs, input.providerRunBudget?.remainingMs() ?? this.timeoutMs));
     try {
       const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/api/embed`, {
         method: "POST",
@@ -166,4 +173,12 @@ function extractJsonObject(text: string) {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForRetry(input: LlmRequest, delayMs: number) {
+  const remainingMs = input.providerRunBudget?.assertAvailable();
+  if (remainingMs !== undefined && delayMs >= remainingMs) {
+    throw new Error(`provider_budget_exhausted:wall_clock:${input.providerRunBudget?.maxElapsedMs}`);
+  }
+  await sleep(delayMs);
 }

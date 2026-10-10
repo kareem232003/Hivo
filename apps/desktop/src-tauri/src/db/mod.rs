@@ -66,6 +66,15 @@ impl DatabaseService {
         Ok(service)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_in_memory() -> rusqlite::Result<Self> {
+        let service = Self {
+            conn: Connection::open_in_memory()?,
+        };
+        service.initialize()?;
+        Ok(service)
+    }
+
     fn initialize(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             r#"
@@ -1089,11 +1098,36 @@ impl DatabaseService {
         session_id: &str,
         patch_id: &str,
     ) -> rusqlite::Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id = ?1 AND COALESCE(canonical_event_type, event_type) = ?2 AND payload LIKE ?3)",
-            params![session_id, EVENT_PATCH_APPROVED, format!("%{}%", patch_id)],
-            |row| row.get(0),
-        )
+        let mut statement = self.conn.prepare(
+            "SELECT COALESCE(canonical_event_type, event_type), payload FROM session_events WHERE session_id = ?1 AND COALESCE(canonical_event_type, event_type) IN (?2, ?3) ORDER BY rowid",
+        )?;
+        let events = statement.query_map(
+            params![session_id, EVENT_PATCH_APPROVED, EVENT_PATCH_REJECTED],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut latest_decision = None;
+        for event in events {
+            let (event_type, payload) = event?;
+            let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            let event_patch_id = value
+                .get("patchId")
+                .or_else(|| value.get("patch_id"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .get("proposal")
+                        .and_then(|proposal| proposal.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| value.get("id").and_then(Value::as_str));
+            if event_patch_id != Some(patch_id) {
+                continue;
+            }
+            latest_decision = Some(event_type == EVENT_PATCH_APPROVED);
+        }
+        Ok(latest_decision.unwrap_or(false))
     }
 }
 
@@ -1539,15 +1573,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    impl DatabaseService {
-        fn new_in_memory() -> rusqlite::Result<Self> {
-            let conn = Connection::open_in_memory()?;
-            let service = Self { conn };
-            service.initialize()?;
-            Ok(service)
-        }
-    }
-
     #[test]
     fn canonicalizes_patch_and_command_event_projections() {
         let db = DatabaseService::new_in_memory().expect("db");
@@ -1727,6 +1752,36 @@ mod tests {
         )
         .expect("approval");
         assert!(db.patch_approval_exists_for_session(session_id, "patch_lookup").expect("approval lookup"));
+
+        db.append_authoritative_session_event(
+            session_id,
+            EVENT_PATCH_REJECTED,
+            &json!({ "patchId": "patch_lookup" }).to_string(),
+        )
+        .expect("rejection");
+        assert!(!db
+            .patch_approval_exists_for_session(session_id, "patch_lookup")
+            .expect("revoked approval lookup"));
+
+        db.append_session_event(
+            session_id,
+            EVENT_PATCH_APPROVED,
+            &json!({ "patchId": "patch_lookup_extra", "status": "approved" }).to_string(),
+        )
+        .expect("similarly named approval");
+        assert!(!db
+            .patch_approval_exists_for_session(session_id, "patch_lookup")
+            .expect("exact patch id lookup"));
+
+        db.append_session_event(
+            session_id,
+            EVENT_PATCH_APPROVED,
+            &json!({ "patchId": "patch_lookup", "status": "approved" }).to_string(),
+        )
+        .expect("approval after rejection");
+        assert!(db
+            .patch_approval_exists_for_session(session_id, "patch_lookup")
+            .expect("restored approval lookup"));
 
         db.append_authoritative_session_event(
             session_id,

@@ -1,3 +1,8 @@
+import type { ContextSnippet } from "./OrchestrationModels.js";
+import type { CommandExecutionProvenance } from "@hivo/protocol";
+
+export type { ContextSnippet };
+
 export const RECURSIVE_SWARM_SCHEMA_VERSION = 2;
 export const DEFAULT_COMPLEXITY_THRESHOLD = 4;
 export const MAX_RECURSIVE_DEPTH = 10;
@@ -101,14 +106,302 @@ export function createGoalEnvelope(input: {
   };
 }
 
+export function isImplementationGoal(goal?: string): boolean {
+  if (!goal) return false;
+  const isExplicitReadOnly =
+    /\b(read-?only|inspect-?only|explain|understand)\b/i.test(goal) &&
+    !/\b(fix|edit|modify|change|patch|implement|update|repair)\b/i.test(goal);
+  if (isExplicitReadOnly) return false;
+  return /\b(add|fix|edit|modify|change|patch|implement|update|repair|make .* change|create)\b/i.test(goal);
+}
+
+export type WorkerResponsibility = "INSPECT" | "IMPLEMENT" | "VERIFY" | "INTEGRATE";
+
+export type WorkerExecutionContract = {
+  nodeId: string;
+  parentId?: string;
+  localObjective: string;
+  originalGoal: string;
+  responsibility: WorkerResponsibility;
+  expectedDeliverable: string;
+  permittedInspectionScope: string[];
+  proposedMutationScope: string[];
+  preservationConstraints: string[];
+  verificationExpectations: string[];
+  authorityProvenance: {
+    parentResponsibility?: WorkerResponsibility;
+    canMutateWorkspace: boolean;
+    isRootGoalImplementation: boolean;
+  };
+};
+
+export function extractLocalTaskObjective(taskPrompt: string, title?: string): string {
+  const childMarker = "CHILD TASK:";
+  const expectedMarker = "\nEXPECTED OUTPUT:";
+  const childIndex = taskPrompt.lastIndexOf(childMarker);
+  if (childIndex !== -1) {
+    const afterChild = taskPrompt.slice(childIndex + childMarker.length);
+    const expectedIndex = afterChild.indexOf(expectedMarker);
+    const local = (expectedIndex === -1 ? afterChild : afterChild.slice(0, expectedIndex)).trim();
+    if (local.length > 0) return local;
+  }
+  const localMarker = "LOCAL TASK OBJECTIVE:";
+  const localIndex = taskPrompt.lastIndexOf(localMarker);
+  if (localIndex !== -1) {
+    const afterLocal = taskPrompt.slice(localIndex + localMarker.length);
+    const expectedIndex = afterLocal.indexOf(expectedMarker);
+    const local = (expectedIndex === -1 ? afterLocal : afterLocal.slice(0, expectedIndex)).trim();
+    if (local.length > 0) return local;
+  }
+  return (title ?? taskPrompt).trim();
+}
+
+export function classifyWorkerResponsibility(input: {
+  title?: string;
+  localObjective?: string;
+  taskPrompt?: string;
+  parentId?: string;
+  expectedOutput?: string;
+  canWrite?: boolean;
+  parentResponsibility?: WorkerResponsibility;
+  isRootGoalImplementation?: boolean;
+  explicitResponsibility?: WorkerResponsibility;
+  originalGoal?: string;
+}): WorkerResponsibility {
+  const title = input.title ?? "";
+  const localObjective = input.localObjective ?? (input.taskPrompt ? extractLocalTaskObjective(input.taskPrompt, title) : "");
+  const expectedOutput = input.expectedOutput ?? "";
+  const canWrite = input.canWrite;
+  const parentResponsibility = input.parentResponsibility;
+  const isRootGoalImplementation = input.isRootGoalImplementation !== undefined
+    ? input.isRootGoalImplementation
+    : (input.originalGoal ? isImplementationGoal(input.originalGoal) : isImplementationGoal(localObjective || title));
+  const explicitResponsibility = input.explicitResponsibility;
+
+  if (explicitResponsibility) {
+    if (explicitResponsibility === "IMPLEMENT") {
+      if (parentResponsibility && parentResponsibility !== "IMPLEMENT") {
+        return "INSPECT";
+      }
+      if (!isRootGoalImplementation && !parentResponsibility) {
+        return "INSPECT";
+      }
+      if (canWrite === false) {
+        return "INSPECT";
+      }
+      return "IMPLEMENT";
+    }
+    return explicitResponsibility;
+  }
+
+  const combinedText = `${title} ${localObjective} ${expectedOutput}`.toLowerCase();
+  if (/\b(collector|merge|synthesize|integrate|reconcile child|child outputs)\b/i.test(combinedText)) {
+    return "INTEGRATE";
+  }
+
+  if (
+    /\b(verify|verification|validate|validation|smoke[- ]check|assert|re-?run tests?|post[- ]check)\b/i.test(combinedText) &&
+    !/\b(fix|modify|implement|write code|patch)\b/i.test(title)
+  ) {
+    return "VERIFY";
+  }
+
+  const isDiagnostic = /\b(diagnose|diagnostic|root[- ]cause|investigate|explore|scan|run tests?|failing test|test output|test failure|stack trace|read[- ]only|inspect|examine|trace|gather evidence|search)\b/i.test(combinedText);
+  const isExplicitEdit = /\b(add|create|fix|edit|modify|change|patch|repair|write code|code patch|implement|update)\b/i.test(`${title} ${localObjective}`);
+  const isRootImplementationDirective = !input.parentId && isRootGoalImplementation;
+
+  if (parentResponsibility && parentResponsibility !== "IMPLEMENT") {
+    return "INSPECT";
+  }
+
+  if (canWrite === false) {
+    return "INSPECT";
+  }
+
+  if ((isExplicitEdit || isRootImplementationDirective) && (isRootGoalImplementation || parentResponsibility === "IMPLEMENT")) {
+    return "IMPLEMENT";
+  }
+
+  if (isDiagnostic) {
+    return "INSPECT";
+  }
+
+  if (canWrite === true && (isRootGoalImplementation || parentResponsibility === "IMPLEMENT")) {
+    return "IMPLEMENT";
+  }
+
+  return "INSPECT";
+}
+
+/**
+ * Normalizes a relative workspace path or scope path.
+ * Returns null if the path is invalid, absolute, or contains traversal segments ('..').
+ */
+export function normalizeScopePath(value?: string | null): string | null {
+  if (!value || typeof value !== "string") return null;
+  let normalized = value.trim().replaceAll("\\", "/");
+  if (!normalized) return null;
+  if (normalized === "*") return "*";
+
+  // Reject absolute paths: POSIX leading slash, Windows drive letter, or UNC paths
+  if (normalized.startsWith("/") || /^[a-zA-Z]:[/\\]/.test(normalized)) {
+    return null;
+  }
+
+  // Remove leading './'
+  while (normalized.startsWith("./")) {
+    normalized = normalized.slice(2);
+  }
+  // Remove trailing '/'
+  while (normalized.endsWith("/") && normalized.length > 1) {
+    normalized = normalized.slice(0, -1);
+  }
+  if (!normalized || normalized === ".") return null;
+
+  const segments = normalized.split("/");
+  for (const seg of segments) {
+    if (seg === ".." || seg === "") return null;
+  }
+
+  return segments.join("/");
+}
+
+/**
+ * Checks whether a child path is safely contained within a parent scope path.
+ * One-directional, component-aware check.
+ */
+export function isPathContainedInScope(childPath: string, parentScopePath: string): boolean {
+  if (parentScopePath === "*") return true;
+
+  const normChild = normalizeScopePath(childPath);
+  const normParent = normalizeScopePath(parentScopePath);
+
+  if (!normChild || !normParent) return false;
+  if (normParent === "*") return true;
+  if (normChild === normParent) return true;
+
+  const childSegments = normChild.split("/");
+  const parentSegments = normParent.split("/");
+
+  // Child must have at least as many path components as parent
+  if (childSegments.length < parentSegments.length) {
+    return false;
+  }
+
+  // Every parent path component must match the child's component at that position
+  for (let i = 0; i < parentSegments.length; i++) {
+    if (childSegments[i] !== parentSegments[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export function createWorkerExecutionContract(input: {
+  nodeId?: string;
+  id?: string;
+  parentId?: string;
+  localObjective?: string;
+  taskPrompt?: string;
+  originalGoal: string;
+  title?: string;
+  expectedOutput?: string;
+  canWrite?: boolean;
+  parentContract?: WorkerExecutionContract;
+  isRootGoalImplementation?: boolean;
+  permittedInspectionScope?: string[];
+  proposedMutationScope?: string[];
+  allowedPaths?: string[];
+  preservationConstraints?: string[];
+  verificationExpectations?: string[];
+  explicitResponsibility?: WorkerResponsibility;
+}): WorkerExecutionContract {
+  const nodeId = input.nodeId ?? input.id ?? "anonymous_worker";
+  const localObjective = input.localObjective ?? (input.taskPrompt ? extractLocalTaskObjective(input.taskPrompt, input.title) : "");
+  const parentResp = input.parentContract?.responsibility;
+  const isRootImpl = input.isRootGoalImplementation ?? (input.parentContract?.authorityProvenance.isRootGoalImplementation ?? isImplementationGoal(input.originalGoal));
+
+  const responsibility = classifyWorkerResponsibility({
+    title: input.title,
+    localObjective,
+    taskPrompt: input.taskPrompt,
+    parentId: input.parentId,
+    expectedOutput: input.expectedOutput,
+    canWrite: input.canWrite,
+    parentResponsibility: parentResp,
+    isRootGoalImplementation: isRootImpl,
+    explicitResponsibility: input.explicitResponsibility,
+    originalGoal: input.originalGoal
+  });
+
+  let effectiveMutationScope: string[] = [];
+  if (responsibility === "IMPLEMENT") {
+    const rawRequested = input.proposedMutationScope ?? input.allowedPaths;
+    const requestedScope = rawRequested
+      ? rawRequested.map(normalizeScopePath).filter((p): p is string => p !== null)
+      : undefined;
+
+    if (input.parentContract) {
+      const parentScope = input.parentContract.proposedMutationScope
+        .map(normalizeScopePath)
+        .filter((p): p is string => p !== null);
+
+      if (input.parentContract.responsibility !== "IMPLEMENT" || parentScope.length === 0) {
+        // Parent has no mutation authority or explicitly empty mutation scope.
+        // Child cannot invent or expand mutation authority.
+        effectiveMutationScope = [];
+      } else if (requestedScope !== undefined) {
+        // Child explicitly requested a sub-scope: only retain paths safely component-contained in parent scope
+        effectiveMutationScope = requestedScope.filter((childPath) =>
+          parentScope.some((parentPath) => isPathContainedInScope(childPath, parentPath))
+        );
+      } else {
+        // Child requested no specific sub-scope: safely inherits parent scope
+        effectiveMutationScope = [...parentScope];
+      }
+    } else if (input.parentId) {
+      // Child node with unsupplied parent contract: cannot invent mutation authority
+      effectiveMutationScope = [];
+    } else {
+      // Root task or un-parented worker: establishes initial authority
+      effectiveMutationScope = requestedScope ? [...requestedScope] : [];
+    }
+  }
+
+  return {
+    nodeId,
+    parentId: input.parentId,
+    localObjective,
+    originalGoal: input.originalGoal,
+    responsibility,
+    expectedDeliverable: input.expectedOutput || (responsibility === "IMPLEMENT" ? "Concrete structured code patch proposal" : "Diagnostic evidence or report"),
+    permittedInspectionScope: input.permittedInspectionScope ?? input.parentContract?.permittedInspectionScope ?? ["*"],
+    proposedMutationScope: effectiveMutationScope,
+    preservationConstraints: input.preservationConstraints ?? input.parentContract?.preservationConstraints ?? ["Do not modify unrelated code or tests outside the target scope."],
+    verificationExpectations: input.verificationExpectations ?? (responsibility === "IMPLEMENT" ? ["Deliverable can be converted to a valid PatchProposal", "Does not introduce broken diff headers"] : ["Evidence accurately captures observed behavior"]),
+    authorityProvenance: {
+      parentResponsibility: parentResp,
+      canMutateWorkspace: false,
+      isRootGoalImplementation: isRootImpl
+    }
+  };
+}
+
 export type SplitSubTask = {
   id: string;
   title: string;
   taskPrompt: string;
   expectedOutput: string;
   dependencies: string[];
+  sourceEvidenceRequirement?: {
+    prerequisiteSubtaskId: string;
+    sourcePath: string;
+    evidenceType: "verified_workspace_source";
+  };
   canWrite?: boolean;
   acceptanceCriteria?: string[];
+  responsibility?: WorkerResponsibility;
 };
 
 export type SplitResult = {
@@ -227,6 +520,9 @@ export type EditIntent = {
   expected_behavior: string;
   risk: "low" | "medium" | "high";
   evidence_refs: string[];
+  exact_old_text?: string;
+  replacement_text?: string;
+  unified_diff?: string;
 };
 
 export type ValidationPlan = {
@@ -278,6 +574,13 @@ export const RECURSIVE_OUTPUT_KINDS: RecursiveOutputKind[] = [
   "review_decision", "integration_summary", "final_summary"
 ];
 
+/** Check if a raw parsed JSON value has a recognized structured output kind */
+export function isStructuredNodeOutputValid(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const kind = (raw as Record<string, unknown>).kind;
+  return typeof kind === "string" && (RECURSIVE_OUTPUT_KINDS as readonly string[]).includes(kind as RecursiveOutputKind);
+}
+
 /** Allowed operation values */
 export const EDIT_INTENT_OPERATIONS = ["create", "modify", "delete", "refactor"] as const;
 
@@ -291,6 +594,17 @@ export const REVIEW_DECISIONS = ["approve", "block", "needs_changes"] as const;
 
 export type RecursiveContextSource = "memory_evidence" | "partial_context" | "prompt_only_fallback";
 
+export type BaselineCommandEvidence = {
+  command: string;
+  requestId?: string;
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
+  status: string;
+  provenance?: CommandExecutionProvenance;
+  artifactRef?: string;
+};
+
 export type MemoryEvidencePack = {
   pack_id: string;
   node_id: string;
@@ -301,6 +615,14 @@ export type MemoryEvidencePack = {
   relevant_files: string[];
   /** File-level line ranges (path → `startLine-endLine`) */
   file_ranges: Record<string, string>;
+  /** Bounded source snippets for relevant files */
+  source_snippets?: ContextSnippet[];
+  /** Alias for source_snippets for compatibility */
+  snippets?: ContextSnippet[];
+  /** Correlated baseline command execution evidence */
+  baseline_command?: BaselineCommandEvidence;
+  baseline_command_result?: BaselineCommandEvidence;
+  baseline_commands?: BaselineCommandEvidence[];
   /** Symbol names in the relevant files */
   symbols: string[];
   /** Known commands from project intake */
@@ -349,6 +671,8 @@ export type RecursiveSwarmNode = {
   updatedAt: string;
   /** Per-node memory evidence pack */
   evidencePack?: MemoryEvidencePack;
+  /** Explicit local execution contract */
+  contract?: WorkerExecutionContract;
 };
 
 export type RecursiveSwarmTree = {
@@ -458,6 +782,12 @@ export type DurableSwarmEvent = {
     | "budget_planned"
     | "budget_gate"
     | "checkpoint_written"
+    | "structured_output_recovery_attempt"
+    | "structured_output_recovery_succeeded"
+    | "structured_output_recovery_failed"
+    | "semantic_recovery_attempt"
+    | "semantic_recovery_succeeded"
+    | "semantic_recovery_failed"
     | "provider_backoff"
     | "error";
   nodeId?: string;
@@ -533,6 +863,23 @@ export function normalizeRecursiveNodeOutput(raw: unknown): { output: RecursiveN
   if (!raw || typeof raw !== "object") {
     return wrapTextFallback(asString(raw, "No structured output produced."));
   }
+  if (Array.isArray(raw)) {
+    const items = raw.filter((item) => item && typeof item === "object");
+    const patchItem = items.find((item) => {
+      const k = (item as Record<string, unknown>).kind;
+      if (k === "edit_intent") return true;
+      if (k === "generated_artifact") {
+        const p = String((item as Record<string, unknown>).path ?? "").toLowerCase();
+        return p.endsWith(".diff") || p.endsWith(".patch") || /\b(fix|patch)\b/i.test(p);
+      }
+      return false;
+    });
+    const chosen = patchItem ?? items[0];
+    if (chosen) {
+      return normalizeRecursiveNodeOutput(chosen);
+    }
+    return wrapTextFallback("Empty array returned; no structured output found.");
+  }
   const obj = raw as Record<string, unknown>;
   const kind = asString(obj.kind, "");
 
@@ -591,6 +938,7 @@ export function normalizeRecursiveNodeOutput(raw: unknown): { output: RecursiveN
   }
 
   if (kind === "edit_intent") {
+    const anyObj = obj as Record<string, unknown>;
     const output: EditIntent = {
       kind: "edit_intent",
       target_file: asString(obj.target_file, "unknown"),
@@ -598,8 +946,11 @@ export function normalizeRecursiveNodeOutput(raw: unknown): { output: RecursiveN
       operation: pickOne(obj.operation, EDIT_INTENT_OPERATIONS as unknown as EditIntent["operation"][], "modify"),
       reason: asString(obj.reason, ""),
       expected_behavior: asString(obj.expected_behavior, ""),
-      risk: pickOne(obj.risk, RISK_LEVELS as unknown as ("low"|"medium"|"high")[], "medium"),
-      evidence_refs: asArray(obj.evidence_refs)
+      risk: pickOne(obj.risk, RISK_LEVELS as unknown as ("low"|"medium"|"high")[], "low"),
+      evidence_refs: asArray(obj.evidence_refs),
+      exact_old_text: typeof anyObj.exact_old_text === "string" ? anyObj.exact_old_text : undefined,
+      replacement_text: typeof anyObj.replacement_text === "string" ? anyObj.replacement_text : undefined,
+      unified_diff: typeof anyObj.unified_diff === "string" ? anyObj.unified_diff : undefined
     };
     return { output, summary: `Edit ${output.operation} ${output.target_file} (${output.risk} risk): ${output.reason.slice(0, 80)}` };
   }

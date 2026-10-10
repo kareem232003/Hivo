@@ -316,6 +316,25 @@ mod tests {
             .preflight_patch(&actual_diff.replace("actual.txt", ".env"), &[".env".to_string()], &workspace)
             .expect_err("secret")
             .starts_with("patch_invalid_secret_file"));
+
+        fs::write(workspace.join("stale.txt"), "current\n").expect("seed stale target");
+        let stale_diff = [
+            "diff --git a/stale.txt b/stale.txt",
+            "--- a/stale.txt",
+            "+++ b/stale.txt",
+            "@@ -1 +1 @@",
+            "-expected",
+            "+changed",
+        ]
+        .join("\n");
+        assert!(service
+            .preflight_patch(&stale_diff, &["stale.txt".to_string()], &workspace)
+            .expect_err("stale patch")
+            .starts_with("patch_invalid_apply_check_failed"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("stale.txt")).expect("read stale target"),
+            "current\n"
+        );
         let _ = fs::remove_dir_all(&workspace);
     }
 

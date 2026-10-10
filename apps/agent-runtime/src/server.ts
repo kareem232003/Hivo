@@ -79,7 +79,7 @@ export async function buildServer(config: RuntimeConfig = loadConfig()): Promise
     if (!body?.message) {
       return reply.status(400).send({ error: "message is required" });
     }
-    return runtime.runTurn(id, body.message);
+    return runtime.runTurn(id, body.message, { thinkFirst: body.thinkFirst });
   });
 
   app.get("/sessions/:id", async (request, reply) => {

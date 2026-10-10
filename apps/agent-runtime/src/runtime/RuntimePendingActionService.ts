@@ -14,6 +14,36 @@ export class RuntimePendingActionService {
 
   async handle(session: AgentRuntimeSession, message: string): Promise<RuntimePendingActionResult> {
     const normalized = message.trim().toLowerCase();
+    if (normalized === "resume_baseline_planning") {
+      if (session.nextAction?.kind === "await_baseline_command") {
+        const action = session.nextAction;
+        const matchingExecution = (session.commandExecutions ?? []).find((execution) =>
+          execution.requestId === action.commandRequestId ||
+          execution.command.trim() === action.command.trim()
+        );
+        const isValidExecution = Boolean(
+          matchingExecution &&
+          typeof matchingExecution.exitCode === "number" &&
+          ((matchingExecution.stdout?.length ?? 0) > 0 || (matchingExecution.stderr?.length ?? 0) > 0) &&
+          matchingExecution.status !== "blocked" &&
+          matchingExecution.diagnosis?.category !== "command_not_found"
+        );
+
+        if (isValidExecution) {
+          await this.sessionManager.updateSession(session.id, (draft) => {
+            draft.nextAction = undefined;
+            draft.status = "running";
+            draft.lifecycleStage = "PLAN";
+          });
+          return {
+            handled: false,
+            resumePrompt: action.originalPrompt
+          };
+        }
+      }
+      return { handled: true };
+    }
+
     if (!session.nextAction) {
       const resumePrompt = buildRecursiveCheckpointResumePrompt(session, message, normalized);
       if (resumePrompt) {

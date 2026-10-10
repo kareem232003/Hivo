@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { EventBus } from "../runtime/EventBus.js";
+import { SessionManager } from "../runtime/SessionManager.js";
+import { RuntimePlanningTurnService } from "../runtime/RuntimePlanningTurnService.js";
+import { RuntimeRecursiveSwarmService } from "../runtime/RuntimeRecursiveSwarmService.js";
+import { RuntimeDirectTurnService } from "../runtime/RuntimeDirectTurnService.js";
+import type { AgentRuntimeSession } from "@hivo/protocol";
+import type { ConversationUnderstanding } from "../runtime/ConversationUnderstanding.js";
 import { RecursiveSwarmOrchestrator } from "../orchestration/RecursiveSwarmOrchestrator.js";
 import { HierarchicalCollector } from "../orchestration/HierarchicalCollector.js";
 import type { MemoryEvidencePack, RecursiveSwarmNode, RecursiveNodeOutput } from "../orchestration/RecursiveSwarmModels.js";
@@ -1366,4 +1376,214 @@ test("bridgeIntegration: bridge output includes qualityMetrics", () => {
   assert.equal(result.qualityMetrics.expansionFailed, 0);
   assert.equal(result.qualityMetrics.blockedByQualityGate, 0);
   assert.equal(result.qualityMetrics.blockedByPatchBuilder, 0);
+});
+
+test("project intake handoff: prelude intake exists and recursive swarm builds repository-grounded evidence packs without prompt_only_fallback", async () => {
+  const workspace = path.join(os.tmpdir(), `hivo-intake-handoff-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  await mkdir(path.join(workspace, "src"), { recursive: true });
+  await writeFile(
+    path.join(workspace, "package.json"),
+    JSON.stringify({ name: "test-index", scripts: { test: "node --test" } }),
+    "utf8"
+  );
+  await writeFile(
+    path.join(workspace, "src", "index.ts"),
+    "export function main() { return 1; }",
+    "utf8"
+  );
+
+  const manager = new SessionManager(path.join(workspace, ".runtime-test"), new EventBus(), {
+    runtimeEventLoader: async () => []
+  });
+  await manager.load();
+
+  const session = await manager.createSession({
+    workspacePath: workspace,
+    mode: "real_provider",
+    executionMode: "auto_mode",
+    userPrompt: "Run recursive tree execution to inspect index in src/index.ts"
+  });
+
+  await manager.addCommandExecution(session.id, {
+    id: "exec_baseline_init",
+    sessionId: session.id,
+    command: "npm test",
+    cwd: workspace,
+    risk: "safe",
+    status: "executed",
+    exitCode: 0,
+    stdout: "pass",
+    stderr: "",
+    autoRun: false,
+    provenance: { source: "agent", trigger: "manual", requestedBy: "agent", sessionId: session.id },
+    createdAt: new Date().toISOString()
+  });
+
+  // Verify before handoff: session.projectIntake is undefined
+  assert.equal(session.projectIntake, undefined, "session.projectIntake must initially be undefined");
+
+  let capturedSessionAtSwarmStart: AgentRuntimeSession | undefined;
+  const mockProvider = {
+    requests: [] as any[],
+    async generateStructured<T>(req: any, schema: any): Promise<T> {
+      this.requests.push(req);
+      const name = schema?.name ?? "";
+      if (name === "expanded_goal_spec") {
+        return {
+          isAlreadyDetailed: true,
+          expandedGoal: req.userPrompt,
+          requirements: ["Inspect index in src/index.ts"],
+          acceptanceCriteria: ["Index inspected"],
+          deliverableContract: "Inspect index",
+          constraints: [],
+          nonGoals: [],
+          qualityBar: ["Complete"]
+        } as T;
+      }
+      if (name === "atomicity_assessment") {
+        return { isAtomic: true, score: 2, rationale: "Atomic fixture.", failures: [] } as T;
+      }
+      if (name === "structured_node_output") {
+        return {
+          kind: "final_summary",
+          summary: "Completed inspection of index in src/index.ts",
+          blockers: [],
+          edit_intents: [],
+          validation_plans: [],
+          confidence: 0.9
+        } as T;
+      }
+      return {} as T;
+    },
+    async generateText(): Promise<string> {
+      return "Completed";
+    }
+  };
+
+  let capturedAssistantMessage: string | undefined;
+  const directTurnService = new RuntimeDirectTurnService(manager);
+  const realRecursiveSwarm = new RuntimeRecursiveSwarmService(manager, directTurnService);
+
+  const recursiveSwarmWrapper = {
+    run: async (input: any) => {
+      // Capture the exact session that recursive swarm retrieves from sessionManager
+      capturedSessionAtSwarmStart = manager.getSession(input.sessionId);
+      const res = await realRecursiveSwarm.run(input);
+      capturedAssistantMessage = res.messages.find((m) => m.role === "assistant")?.content;
+      return res;
+    }
+  };
+
+  const planningTurnService = new RuntimePlanningTurnService(manager, {
+    intentContract: {
+      compile: async () => ({
+        ready: true,
+        contract: {
+          version: 1,
+          status: "ready",
+          original_user_request: "Run recursive tree execution to inspect index in src/index.ts",
+          precise_rewrite: "Run recursive tree execution to inspect index in src/index.ts",
+          task_type: "edit",
+          target_files: ["src/index.ts"],
+          acceptance_criteria: [],
+          constraints: [],
+          assumptions: [],
+          risks: [],
+          blocking_questions: [],
+          non_blocking_questions: [],
+          provider_request_refs: ["ref_req_1"],
+          created_at: new Date().toISOString()
+        } as any,
+        blockingQuestions: [],
+        validationErrors: [],
+        errors: []
+      }),
+      blockPlanning: async () => ({ sessionId: session.id, status: "needs_approval" as const })
+    } as any,
+    recursiveSwarm: recursiveSwarmWrapper as any,
+    recursiveFactoryPlanning: {} as any,
+    providerBackedSwarm: {} as any,
+    runEngine: {} as any
+  });
+
+  const providerContext = {
+    provider: mockProvider,
+    routerProvider: mockProvider,
+    verifierProvider: mockProvider,
+    telemetry: {
+      snapshot: () => ({
+        providerRequestRefs: ["ref_req_1"],
+        providerRequestCount: 1,
+        providerFailureCount: 0,
+        providerTimeoutCount: 0,
+        reasoningAttempts: 1,
+        repairAttempts: 0,
+        finalResponseSource: "none"
+      })
+    }
+  };
+
+  const conversationUnderstanding: ConversationUnderstanding = {
+    originalMessage: "Run recursive tree execution to inspect index in src/index.ts",
+    workspaceMessage: "Run recursive tree execution to inspect index in src/index.ts",
+    preparedPrompt: {
+      originalMessage: "Run recursive tree execution to inspect index in src/index.ts",
+      workspaceMessage: "Run recursive tree execution to inspect index in src/index.ts",
+      droppedPreamble: ""
+    },
+    intentDecision: {
+      kind: "workspace_action",
+      language: "english",
+      needsWorkspace: true,
+      confidence: "high",
+      rationale: "Inspect index"
+    },
+    routeDecision: {
+      route: "orchestrated_run",
+      confidence: "high",
+      language: "english",
+      normalizedPrompt: "Run recursive tree execution to inspect index in src/index.ts",
+      workspacePrompt: "Run recursive tree execution to inspect index in src/index.ts",
+      rationale: "Inspect index"
+    }
+  };
+
+  try {
+    await planningTurnService.run({
+      sessionId: session.id,
+      session,
+      prompt: "Run recursive tree execution to inspect index in src/index.ts",
+      conversationUnderstanding,
+      decisionPipelineId: "test_pipeline",
+      providerContext: providerContext as any,
+      swarmMode: "recursive_tree"
+    });
+
+    const finalSession = manager.getSession(session.id)!;
+
+    // 1. prelude intake exists
+    assert.ok(finalSession.projectIntake, "1. prelude intake exists");
+    assert.equal(finalSession.projectIntake.intakeStatus, "completed");
+    assert.ok(finalSession.projectIntake.importantFiles.length > 0, "intake discovered workspace files");
+    assert.ok(finalSession.contextPack, "contextPack exists");
+    assert.ok(finalSession.runIntent, "runIntent exists");
+
+    // 2. recursive swarm receives that intake
+    assert.ok(capturedSessionAtSwarmStart, "recursive swarm was called");
+    assert.ok(capturedSessionAtSwarmStart.projectIntake, "2. recursive swarm receives that intake");
+    assert.equal(capturedSessionAtSwarmStart.projectIntake, finalSession.projectIntake, "recursive swarm receives the exact projectIntake");
+    assert.equal(capturedSessionAtSwarmStart.contextPack, finalSession.contextPack, "recursive swarm receives the exact contextPack");
+    assert.equal(capturedSessionAtSwarmStart.runIntent, finalSession.runIntent, "recursive swarm receives the exact runIntent");
+
+    // 3. at least one node uses repository-grounded context
+    assert.ok(capturedAssistantMessage, "assistant message produced by recursive swarm");
+    assert.match(capturedAssistantMessage, /\[Context-source summary:.*nodes used memory evidence/);
+    assert.ok((finalSession.recursiveSwarmRunState?.tree?.nodeCount ?? 0) > 0, "tree nodes were created");
+
+    // 4. prompt_only_fallback is not used when project intake exists
+    assert.doesNotMatch(capturedAssistantMessage, /used prompt-only fallback/);
+    assert.match(capturedAssistantMessage, /\[Context-source summary: 2\/2 nodes used memory evidence\]/);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });

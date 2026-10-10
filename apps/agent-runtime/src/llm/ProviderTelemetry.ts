@@ -5,13 +5,18 @@ import type {
   ProviderTruthTelemetry,
   SanitizedProviderConfig
 } from "@hivo/protocol";
-import type { EmbeddingRequest, EmbeddingResponse, LlmProvider, LlmRequest } from "./LlmProvider.js";
+import { ProviderRunBudget, type EmbeddingRequest, type EmbeddingResponse, type LlmProvider, type LlmRequest } from "./LlmProvider.js";
+
+export const DEFAULT_RUN_MAX_PROVIDER_CALLS = 24;
+export const DEFAULT_RUN_MAX_WALL_CLOCK_MS = 1_200_000;
 
 type ProviderTelemetryInput = {
   mode: AgentRuntimeMode;
   providerConfig?: SanitizedProviderConfig;
   activeProviderSource?: ActiveProviderSource;
   modelCertification?: ProviderTruthTelemetry["modelCertification"];
+  maxProviderCalls?: number;
+  maxElapsedMs?: number;
 };
 
 type ProviderRequestType = ProviderPromptLatency["requestType"];
@@ -30,15 +35,32 @@ export class ProviderTelemetryRecorder {
   private finalResponseSource: ProviderTruthTelemetry["finalResponseSource"] = "none";
   private terminalFailure: string | undefined;
 
-  constructor(private readonly input: ProviderTelemetryInput) {}
+  private readonly runBudget: ProviderRunBudget;
 
-  async measure<T>(requestType: ProviderRequestType, request: LlmRequest, operation: () => Promise<T>): Promise<T> {
+  constructor(private readonly input: ProviderTelemetryInput) {
+    this.runBudget = new ProviderRunBudget(
+      input.maxProviderCalls ?? DEFAULT_RUN_MAX_PROVIDER_CALLS,
+      input.maxElapsedMs ?? DEFAULT_RUN_MAX_WALL_CLOCK_MS
+    );
+  }
+
+  async measure<T>(
+    requestType: ProviderRequestType,
+    request: LlmRequest,
+    operation: (boundedRequest: LlmRequest) => Promise<T>
+  ): Promise<T> {
     const requestId = `provider_${Date.now()}_${this.providerRequestCount + 1}`;
     const promptSize = measureProviderPromptSize(request);
     const startedAt = Date.now();
-    this.providerRequestCount += 1;
     try {
-      const result = await operation();
+      const remainingMs = this.runBudget.reserveCall();
+      this.providerRequestCount += 1;
+      const boundedRequest: LlmRequest = {
+        ...request,
+        timeoutMs: Math.min(request.timeoutMs ?? remainingMs, remainingMs),
+        providerRunBudget: this.runBudget
+      };
+      const result = await operation(boundedRequest);
       this.recordLatency({
         requestId,
         requestType,
@@ -95,8 +117,8 @@ export class ProviderTelemetryRecorder {
       providerName,
       modelName,
       providerBaseUrl: sanitizeProviderBaseUrl(this.input.providerConfig?.baseUrl),
-      providerRequestCount: this.providerRequestCount,
-      realProviderRequestCount: this.providerRequestCount,
+      providerRequestCount: this.runBudget.callCount,
+      realProviderRequestCount: this.runBudget.callCount,
       providerResponseCount: this.providerResponseCount,
       providerFailureCount: this.providerFailureCount,
       providerTimeoutCount: this.providerTimeoutCount,
@@ -151,20 +173,25 @@ export class TelemetryLlmProvider implements LlmProvider {
   ) {}
 
   generateStructured<T>(input: LlmRequest, schema: unknown): Promise<T> {
-    return this.recorder.measure("structured", input, () => this.inner.generateStructured<T>(input, schema));
+    return this.recorder.measure("structured", input, (boundedRequest) => this.inner.generateStructured<T>(boundedRequest, schema));
   }
 
   generateText(input: LlmRequest): Promise<string> {
-    return this.recorder.measure("text", input, () => this.inner.generateText(input));
+    return this.recorder.measure("text", input, (boundedRequest) => this.inner.generateText(boundedRequest));
   }
 
   embed(input: EmbeddingRequest): Promise<EmbeddingResponse> {
     if (!this.inner.embed) return Promise.reject(new Error("provider.embedding_not_supported"));
-    return this.recorder.measure("structured", {
+    const request: LlmRequest = {
       purpose: "retrieve",
       systemPrompt: "Embedding request",
       userPrompt: input.inputs.join("\n")
-    }, () => this.inner.embed!(input));
+    };
+    return this.recorder.measure("structured", request, (boundedRequest) => this.inner.embed!({
+      ...input,
+      timeoutMs: boundedRequest.timeoutMs,
+      providerRunBudget: boundedRequest.providerRunBudget
+    }));
   }
 }
 

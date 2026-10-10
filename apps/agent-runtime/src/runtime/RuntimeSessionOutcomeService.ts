@@ -18,16 +18,52 @@ export class RuntimeSessionOutcomeService {
 
   async sync(sessionId: string) {
     const before = this.requireSession(sessionId);
-    if (before.accessProfile === "full_access" || before.accessProfile === "auto_review") {
-      await this.sessionManager.updateSession(sessionId, (draft) => {
-        draft.status = "completed";
-        draft.lifecycleStage = "DONE";
-        setRunPhaseState(draft, "integrate_changes", "completed", "Full Access mode: patch auto-approved.");
-        setRunPhaseState(draft, "run_verification", "completed", "Full Access mode: verification auto-approved.");
-        setRunPhaseState(draft, "review_final_diff", "completed", "Full Access mode: no approval needed.");
-        setRunPhaseState(draft, "final_report", "completed", "Full Access mode: run completed.");
-      });
+    const { activeBaselineAction, isValidBaseline } = getValidBaselineDetails(before);
+
+    const hasUnappliedPatch = before.patchProposals.some(
+      (proposal) => proposal.status === "proposed" || proposal.status === "approved" || proposal.status === "apply_started"
+    );
+    const hasPendingCommands = before.commandRequests.some(
+      (request) => request.status === "requested" || request.status === "approved" || request.status === "executing" || request.status === "running"
+    );
+    const hasApplyFailure = before.patchProposals.some((proposal) => proposal.status === "apply_failed");
+    const hasAppliedPatch = before.patchProposals.some((proposal) => proposal.status === "applied");
+    const hasFailedNonBaselineCommands = before.commandRequests.some((request) => {
+      if (isBaselineCommand(before, request.id, request.command, request.reason, request.provenance)) {
+        return false;
+      }
+      return (
+        request.status === "failed" ||
+        request.status === "blocked" ||
+        request.status === "rejected" ||
+        request.status === "denied" ||
+        request.status === "orphaned" ||
+        request.status === "terminated"
+      );
+    });
+
+    if (before.status === "blocked" || before.lifecycleStage === "BLOCKED" || before.status === "failed" || before.lifecycleStage === "FAILED") {
       return;
+    }
+
+    if (before.accessProfile === "full_access" || before.accessProfile === "auto_review") {
+      if (activeBaselineAction && isValidBaseline) {
+        return;
+      }
+      if (hasUnappliedPatch || hasPendingCommands || hasApplyFailure || hasFailedNonBaselineCommands) {
+        // Do NOT short-circuit to completed/DONE when patches or commands are in flight or failed.
+        // Let the state machine below determine the authoritative lifecycle stage (APPLY, POST_VERIFY, FAILED).
+      } else {
+        await this.sessionManager.updateSession(sessionId, (draft) => {
+          draft.status = "completed";
+          draft.lifecycleStage = "DONE";
+          setRunPhaseState(draft, "integrate_changes", "completed", "Full Access mode: patch auto-approved.");
+          setRunPhaseState(draft, "run_verification", "completed", "Full Access mode: verification auto-approved.");
+          setRunPhaseState(draft, "review_final_diff", "completed", "Full Access mode: no approval needed.");
+          setRunPhaseState(draft, "final_report", "completed", "Full Access mode: run completed.");
+        });
+        return;
+      }
     }
 
     const verification = buildRuntimeVerification(before);
@@ -45,9 +81,19 @@ export class RuntimeSessionOutcomeService {
       const hasPendingCommands = draft.commandRequests.some(
         (request) => request.status === "requested" || request.status === "approved" || request.status === "executing" || request.status === "running"
       );
-      const hasFailedCommands = draft.commandRequests.some(
-        (request) => request.status === "failed" || request.status === "blocked" || request.status === "rejected" || request.status === "denied" || request.status === "orphaned" || request.status === "terminated"
-      );
+      const hasFailedCommands = draft.commandRequests.some((request) => {
+        if (isBaselineCommand(before, request.id, request.command, request.reason, request.provenance)) {
+          return false;
+        }
+        return (
+          request.status === "failed" ||
+          request.status === "blocked" ||
+          request.status === "rejected" ||
+          request.status === "denied" ||
+          request.status === "orphaned" ||
+          request.status === "terminated"
+        );
+      });
       const reconciliationStatus = draft.reconciliationReport?.status;
       const scopeVerdict = draft.latestScopeValidation?.verdict;
       const runToGreenStatus = draft.runToGreen?.status;
@@ -141,6 +187,27 @@ export class RuntimeSessionOutcomeService {
         return;
       }
 
+      const { activeBaselineAction, isValidBaseline, isInfraFailure } = getValidBaselineDetails(before);
+
+      if (activeBaselineAction && isInfraFailure) {
+        draft.status = "failed";
+        draft.lifecycleStage = "FAILED";
+        draft.nextAction = undefined;
+        if (draft.moduleExecutionPlan) {
+          draft.moduleExecutionPlan.status = "failed";
+        }
+        setRunPhaseState(draft, "run_verification", "failed", "Baseline test execution encountered an infrastructure failure.", 1);
+        setRunPhaseState(draft, "final_report", "completed", "Run failed due to baseline command infrastructure failure.");
+        return;
+      }
+
+      if (activeBaselineAction && isValidBaseline) {
+        draft.nextAction = activeBaselineAction;
+        draft.status = "needs_approval";
+        draft.lifecycleStage = "INTAKE";
+        return;
+      }
+
       if (hasPendingPatchReview) {
         draft.status = "needs_approval";
         draft.lifecycleStage = "APPROVAL";
@@ -179,7 +246,13 @@ export class RuntimeSessionOutcomeService {
         return;
       }
 
-      if (hasAppliedPatch && (reconciliationStatus === "pending" || reconciliationStatus === "not_run")) {
+      if (
+        hasAppliedPatch &&
+        draft.accessProfile !== "full_access" &&
+        draft.accessProfile !== "auto_review" &&
+        verification.status !== "passed" &&
+        (reconciliationStatus === "pending" || reconciliationStatus === "not_run")
+      ) {
         draft.status = "needs_approval";
         draft.lifecycleStage = "POST_VERIFY";
         draft.nextAction = undefined;
@@ -204,7 +277,11 @@ export class RuntimeSessionOutcomeService {
         return;
       }
 
-      if (hasAppliedPatch && reconciliationStatus === "unavailable") {
+      if (
+        hasAppliedPatch &&
+        reconciliationStatus === "unavailable" &&
+        verification?.status !== "passed"
+      ) {
         draft.status = "needs_approval";
         draft.lifecycleStage = "POST_VERIFY";
         draft.nextAction = undefined;
@@ -315,6 +392,7 @@ function setRunPhaseState(
 }
 
 export function buildRuntimeVerification(session: AgentRuntimeSession) {
+  const { activeBaselineAction, isValidBaseline, isInfraFailure } = getValidBaselineDetails(session);
   const patchProposalCount = session.patchProposals.length;
   const appliedPatchCount = session.patchProposals.filter((proposal) => proposal.status === "applied").length;
   const applyFailed = session.patchProposals.some((proposal) => proposal.status === "apply_failed");
@@ -323,10 +401,15 @@ export function buildRuntimeVerification(session: AgentRuntimeSession) {
   const pendingPatchReview = session.patchProposals.some((proposal) => proposal.status === "proposed");
   const reconciliation = session.reconciliationReport;
   const commandStatuses = session.commandRequests.map((request) => ({
+    id: request.id,
     command: request.command,
     status: request.status
   }));
-  const commandFailed = commandStatuses.some((command) => command.status === "failed" || command.status === "blocked" || command.status === "denied" || command.status === "orphaned" || command.status === "terminated");
+  const commandFailed = commandStatuses.some(
+    (command) =>
+      !isBaselineCommand(session, command.id, command.command) &&
+      (command.status === "failed" || command.status === "blocked" || command.status === "denied" || command.status === "orphaned" || command.status === "terminated")
+  );
   const commandPending = commandStatuses.some(
     (command) => command.status === "requested" || command.status === "approved" || command.status === "executing" || command.status === "running"
   );
@@ -334,10 +417,17 @@ export function buildRuntimeVerification(session: AgentRuntimeSession) {
   const successfulExecutions = session.commandExecutions.filter((execution) =>
     (execution.status === "executed" || execution.status === "completed") && (execution.exitCode === undefined || execution.exitCode === 0)
   );
-  const failedExecutions = session.commandExecutions.filter((execution) =>
-    execution.status === "failed"
-    || ((execution.status === "executed" || execution.status === "completed") && typeof execution.exitCode === "number" && execution.exitCode !== 0)
-  );
+  const failedExecutions = session.commandExecutions.filter((execution) => {
+    if (isBaselineExecution(session, execution)) {
+      return false;
+    }
+    return (
+      execution.status === "failed" ||
+      ((execution.status === "executed" || execution.status === "completed") &&
+        typeof execution.exitCode === "number" &&
+        execution.exitCode !== 0)
+    );
+  });
   const blockedExecutions = session.commandExecutions.filter((execution) => execution.status === "blocked");
   const approvalRequiredExecutions = session.commandExecutions.filter((execution) => execution.status === "approval_required");
   const runtimeErrorExecutions = session.commandExecutions.filter((execution) =>
@@ -384,7 +474,7 @@ export function buildRuntimeVerification(session: AgentRuntimeSession) {
           ? "failed"
       : runToGreenBlockedBeforeExecution
         ? "unavailable"
-        : runToGreenTerminalFailure || applyFailed || (!runToGreenActive && commandFailed) || reconciliation?.status === "diverged" || reconciliation?.status === "failed"
+        : runToGreenTerminalFailure || applyFailed || (!runToGreenActive && commandFailed) || reconciliation?.status === "diverged" || reconciliation?.status === "failed" || isInfraFailure
         ? "failed"
         : runToGreen?.status === "running" || pendingPatchReview || pendingPatchApply || patchApplyStarted || commandPending || backgroundRunning || reconciliation?.status === "pending"
           ? "pending"
@@ -633,4 +723,96 @@ function buildReviewGateSummary(
 
 function uniqueRuntimeStrings(values: string[]) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function getValidBaselineDetails(session: AgentRuntimeSession) {
+  const activeBaselineAction = session.nextAction?.kind === "await_baseline_command" ? session.nextAction : undefined;
+  if (!activeBaselineAction) return { activeBaselineAction: undefined, isValidBaseline: false, isInfraFailure: false };
+  const baselineExecution = (session.commandExecutions ?? []).find((execution) =>
+    execution.requestId === activeBaselineAction.commandRequestId ||
+    execution.command.trim() === activeBaselineAction.command.trim()
+  );
+  const isInfraFailure = Boolean(
+    baselineExecution &&
+    (baselineExecution.status === "blocked" ||
+      typeof baselineExecution.exitCode !== "number" ||
+      baselineExecution.diagnosis?.category === "command_not_found")
+  );
+  const isValidBaseline = Boolean(
+    baselineExecution &&
+    typeof baselineExecution.exitCode === "number" &&
+    ((baselineExecution.stdout?.length ?? 0) > 0 || (baselineExecution.stderr?.length ?? 0) > 0) &&
+    !isInfraFailure
+  );
+  return { activeBaselineAction, isValidBaseline, isInfraFailure };
+}
+
+function isCorrelatedValidBaseline(
+  session: AgentRuntimeSession,
+  activeBaselineAction: Extract<AgentRuntimeSession["nextAction"], { kind: "await_baseline_command" }> | undefined,
+  isValidBaseline: boolean,
+  requestId?: string,
+  command?: string
+) {
+  if (!activeBaselineAction || !isValidBaseline) return false;
+  return (requestId !== undefined && requestId === activeBaselineAction.commandRequestId) ||
+    (command !== undefined && command.trim() === activeBaselineAction.command.trim());
+}
+
+export function isBaselineCommand(
+  session: AgentRuntimeSession,
+  requestId?: string,
+  command?: string,
+  reason?: string,
+  provenance?: import("@hivo/protocol").CommandExecutionProvenance
+): boolean {
+  const matchingExecution = (session.commandExecutions ?? []).find((exec) =>
+    (requestId !== undefined && exec.requestId === requestId) ||
+    (command !== undefined && exec.command.trim() === command.trim())
+  );
+  if (
+    matchingExecution &&
+    (matchingExecution.status === "blocked" ||
+      typeof matchingExecution.exitCode !== "number" ||
+      matchingExecution.diagnosis?.category === "command_not_found")
+  ) {
+    return false;
+  }
+  if (reason?.toLowerCase().includes("baseline") || provenance?.reason?.toLowerCase().includes("baseline")) {
+    return true;
+  }
+  const { activeBaselineAction, isValidBaseline } = getValidBaselineDetails(session);
+  if (isCorrelatedValidBaseline(session, activeBaselineAction, isValidBaseline, requestId, command)) {
+    return true;
+  }
+  if (requestId) {
+    const matchingReq = session.commandRequests.find((r) => r.id === requestId);
+    if (matchingReq && (matchingReq.reason?.toLowerCase().includes("baseline") || matchingReq.provenance?.reason?.toLowerCase().includes("baseline"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isBaselineExecution(
+  session: AgentRuntimeSession,
+  execution: import("@hivo/protocol").CommandExecutionRecord
+): boolean {
+  if (
+    execution.status === "blocked" ||
+    typeof execution.exitCode !== "number" ||
+    execution.diagnosis?.category === "command_not_found"
+  ) {
+    return false;
+  }
+  if (execution.provenance?.reason?.toLowerCase().includes("baseline")) {
+    return true;
+  }
+  if (execution.requestId) {
+    if (isBaselineCommand(session, execution.requestId, execution.command)) {
+      return true;
+    }
+  }
+  const { activeBaselineAction, isValidBaseline } = getValidBaselineDetails(session);
+  return isCorrelatedValidBaseline(session, activeBaselineAction, isValidBaseline, execution.requestId, execution.command);
 }

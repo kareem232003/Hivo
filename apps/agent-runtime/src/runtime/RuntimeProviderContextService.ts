@@ -15,6 +15,8 @@ export type RuntimeProviderContext = {
 
 export type RuntimeProviderContextServiceOptions = {
   providerRequestTimeoutMs: number;
+  maxProviderCallsPerRun?: number;
+  maxRunWallClockMs?: number;
   getProvider: (session: AgentRuntimeSession) => LlmProvider;
   createProvider: (config: AgentRuntimeSession["providerConfig"], timeoutMs: number) => LlmProvider;
   useSessionProviderForSpecializedModels: boolean;
@@ -31,7 +33,9 @@ export class RuntimeProviderContextService {
       mode: session.mode,
       providerConfig: session.providerConfig,
       activeProviderSource: session.activeProviderSource,
-      modelCertification
+      modelCertification,
+      maxProviderCalls: this.options.maxProviderCallsPerRun,
+      maxElapsedMs: this.options.maxRunWallClockMs
     });
     const provider = new TelemetryLlmProvider(this.options.getProvider(session), telemetry);
     return {

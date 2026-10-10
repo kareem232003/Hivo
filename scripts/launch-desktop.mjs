@@ -30,10 +30,14 @@ async function main() {
   if (freshLaunch) {
     process.env.HIVO_DEV_FRESH = "1";
     stopDesktopProcess();
-    await stopDevProcessOnPort(4317, "runtime");
+    const stopped = await stopDevProcessOnPort(4317, "runtime");
+    if (!stopped) {
+      process.stderr.write("Failed to stop existing runtime on 127.0.0.1:4317. Port is still occupied.\n");
+      process.exit(1);
+    }
   }
 
-  const runtimeAlreadyHealthy = await isRuntimeHealthy();
+  const runtimeAlreadyHealthy = !freshLaunch && await isRuntimeHealthy();
   if (runtimeAlreadyHealthy) {
     process.stdout.write("Runtime already running on 127.0.0.1:4317. Reusing it because --reuse was requested.\n");
   } else {
@@ -104,6 +108,16 @@ async function waitForRuntime() {
   return false;
 }
 
+async function waitForPortToFree(port) {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (findProcessIdsOnPort(port).length === 0) {
+      return true;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
 function isDesktopAlreadyRunning() {
   if (isWindows) {
     const result = spawnSync("tasklist", ["/FI", "IMAGENAME eq hivo-desktop.exe"], {
@@ -141,24 +155,62 @@ function sleep(ms) {
 
 async function stopDevProcessOnPort(port, name) {
   const processIds = findProcessIdsOnPort(port).filter((pid) => pid && pid !== process.pid);
-  if (!processIds.length) return;
+  if (!processIds.length) return true;
   process.stdout.write(`Fresh dev launch: stopping existing ${name} process on 127.0.0.1:${port} (${processIds.join(", ")}).\n`);
   for (const pid of processIds) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // The process may have exited between discovery and shutdown.
+    if (isWindows) {
+      const targetPid = findRuntimeNpmAncestorPid(pid);
+      spawnSync("taskkill", ["/PID", String(targetPid), "/F", "/T"], {
+        cwd: root,
+        stdio: "ignore"
+      });
+    } else {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // The process may have exited between discovery and shutdown.
+      }
     }
   }
-  await sleep(800);
-  for (const pid of processIds) {
-    if (!isProcessAlive(pid)) continue;
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Ignore cleanup races.
+  if (!isWindows) {
+    await sleep(800);
+    for (const pid of processIds) {
+      if (!isProcessAlive(pid)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore cleanup races.
+      }
     }
   }
+  return await waitForPortToFree(port);
+}
+
+function findRuntimeNpmAncestorPid(listenerPid) {
+  if (!isWindows) return listenerPid;
+  const script = [
+    `$current = ${listenerPid}`,
+    `while ($current -and $current -gt 0) {`,
+    `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $current"`,
+    `  if (-not $proc -or -not $proc.ParentProcessId) { break }`,
+    `  $ppid = $proc.ParentProcessId`,
+    `  $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $ppid"`,
+    `  if (-not $parent) { break }`,
+    `  $cmd = $parent.CommandLine`,
+    `  if ($cmd -and ($cmd -match "npm" -and $cmd -match "run\\s+dev" -and $cmd -match "@hivo/agent-runtime")) {`,
+    `    Write-Output $ppid`,
+    `    exit 0`,
+    `  }`,
+    `  $current = $ppid`,
+    `}`,
+    `Write-Output ${listenerPid}`
+  ].join("; ");
+  const result = spawnSync("powershell", ["-NoProfile", "-Command", script], {
+    cwd: root,
+    encoding: "utf8"
+  });
+  const parsed = Number(result.stdout?.trim().split(/\s+/)[0]);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : listenerPid;
 }
 
 function findProcessIdsOnPort(port) {

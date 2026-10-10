@@ -1127,4 +1127,11 @@ export type SessionNextAction =
       kind: "preview_ready";
       message: string;
       preview: PreviewRecommendation;
+    }
+  | {
+      kind: "await_baseline_command";
+      commandRequestId: string;
+      command: string;
+      originalPrompt: string;
+      message: string;
     };

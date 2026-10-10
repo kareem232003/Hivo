@@ -97,6 +97,7 @@ export * from "./PromptQualityGate.js";
 export * from "./PromptWriterModels.js";
 export * from "./PromptWriterService.js";
 export * from "./ProviderBackedSwarmWorker.js";
+export * from "./ProviderPlanningEvidenceBootstrapper.js";
 export * from "./QueueDrivenTaskScheduler.js";
 export * from "./ReadOnlySwarmWorkerSchemas.js";
 export * from "./RepairLoop.js";

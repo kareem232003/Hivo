@@ -90,6 +90,7 @@ import {
   openExternalTarget,
   pickWorkspaceDirectory,
   readWorkspaceFile,
+  rejectRuntimePatchViaRust,
   restartWithLatestCode,
   runWorkspaceCommand,
   upsertAgentRun,
@@ -287,6 +288,41 @@ const accessOptions: AccessOption[] = [
   }
 ];
 
+function isPreSessionErrorMessage(msg: string): boolean {
+  if (!msg) return false;
+  const lower = msg.toLowerCase();
+  if (
+    lower.startsWith("select a workspace") ||
+    lower.startsWith("workspace open:") ||
+    lower === "workspace selection canceled." ||
+    lower === "input size reset." ||
+    lower.startsWith("input size ") ||
+    lower.startsWith("plan mode enabled") ||
+    lower.startsWith("model provider saved") ||
+    lower.startsWith("model provider configuration cleared") ||
+    lower.startsWith("restarting hivo") ||
+    lower.startsWith("new chat ready") ||
+    lower.startsWith("restored session:") ||
+    lower.startsWith("archived chat:") ||
+    lower.startsWith("inspecting files in")
+  ) {
+    return false;
+  }
+  return (
+    msg.startsWith("Error:") ||
+    lower.includes("error") ||
+    lower.includes("failed") ||
+    lower.includes("unavailable") ||
+    lower.includes("valid model provider") ||
+    lower.includes("open a workspace before starting") ||
+    lower.includes("write a task in the input area first")
+  );
+}
+
+function cleanPreSessionErrorMessage(msg: string): string {
+  return msg.replace(/^(?:Error|RuntimeHttpError):\s*/i, "");
+}
+
 export function App() {
   const workspaceInputRef = useRef<HTMLInputElement | null>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -294,6 +330,7 @@ export function App() {
   const runtimeEventUnsubscribeRef = useRef<(() => void) | null>(null);
   const autoRunningCommandIdsRef = useRef<Set<string>>(new Set());
   const autoApplyingPatchIdsRef = useRef<Set<string>>(new Set());
+  const baselineContinuationTriggeredRef = useRef<Set<string>>(new Set());
   const lastCommandCountRef = useRef(0);
   const lastPreviewTargetRef = useRef("");
   const suppressPreviewOpenRef = useRef(false);
@@ -714,9 +751,9 @@ export function App() {
               reconciliationSnapshot:
                 applied.beforeSnapshot || applied.afterSnapshot
                   ? {
-                      before: applied.beforeSnapshot,
-                      after: applied.afterSnapshot
-                    }
+                    before: applied.beforeSnapshot,
+                    after: applied.afterSnapshot
+                  }
                   : undefined
             },
             runtimeSessionToken || undefined
@@ -828,6 +865,8 @@ export function App() {
   const showProgressRail = Boolean(runtimeSession && (railCurrentStep || railActivityItems.length));
   const hasPromptDraft = prompt.trim().length > 0;
   const sendButtonDisabled = !workspace || !hasPromptDraft;
+  const preSessionErrorMessage =
+    !runtimeSession && isPreSessionErrorMessage(message) ? cleanPreSessionErrorMessage(message) : null;
   const fileExplorerTree = buildFileExplorerTree(files, fileExplorerFilter);
   const planModeSuggestionVisible = shouldSuggestPlanMode(prompt, thinkFirst);
 
@@ -868,6 +907,7 @@ export function App() {
     setRuntimeSessionToken("");
     setRuntimeConnectionState("connected");
     setSseConnectionState(INITIAL_SSE_STATE);
+    setThinkFirst(false);
     const nextWorkspace = await openWorkspace(normalizedPath);
     setWorkspacePath(normalizedPath);
     setWorkspace(nextWorkspace);
@@ -937,29 +977,29 @@ export function App() {
 
   const latestCodeButtonState = restartingApp
     ? {
-        label: "Updating...",
-        className: "updating",
-        title: "Restarting the desktop, runtime, and dev server with the latest local code."
-      }
+      label: "Updating...",
+      className: "updating",
+      title: "Restarting the desktop, runtime, and dev server with the latest local code."
+    }
     : codeFreshness?.status === "stale"
       ? {
-          label: "Update Required",
-          className: "stale",
-          title: codeFreshness.staleFiles.length
-            ? `Restart required for: ${codeFreshness.staleFiles.join(", ")}`
-            : "Local runtime code changed after this app started."
-        }
+        label: "Update Required",
+        className: "stale",
+        title: codeFreshness.staleFiles.length
+          ? `Restart required for: ${codeFreshness.staleFiles.join(", ")}`
+          : "Local runtime code changed after this app started."
+      }
       : !codeFreshness || codeFreshness.status === "unknown"
         ? {
-            label: "Latest Unknown",
-            className: "unknown",
-            title: codeFreshness?.reason ?? "Could not prove that every running component uses the latest code."
-          }
+          label: "Latest Unknown",
+          className: "unknown",
+          title: codeFreshness?.reason ?? "Could not prove that every running component uses the latest code."
+        }
         : {
-            label: "Restart Latest",
-            className: "fresh",
-            title: "All running components use the latest detected local code. Click to force a fresh restart."
-          };
+          label: "Restart Latest",
+          className: "fresh",
+          title: "All running components use the latest detected local code. Click to force a fresh restart."
+        };
 
   async function handleRunCommand() {
     try {
@@ -1026,6 +1066,9 @@ export function App() {
     const merged = mergeRuntimeSessionState(runtimeSession, session);
     setRuntimeSession((current) => mergeRuntimeSessionState(current, session));
     mirrorRuntimeSession(merged);
+    if (typeof session.thinkFirst === "boolean") {
+      setThinkFirst(session.thinkFirst);
+    }
     if (isTerminalOrOperatorHeldSession(merged)) {
       setAgentBusy(false);
     }
@@ -1112,6 +1155,7 @@ export function App() {
       setRuntimeSession(null);
       setRuntimeSessionToken("");
       setRuntimeConnectionState("connected");
+      setThinkFirst(false);
     }
     setActivityOpen(false);
     setMessage(`Archived chat: ${entry.title}`);
@@ -1178,11 +1222,13 @@ export function App() {
     if (containsArabic(normalizedInput)) {
       setRtlTextMode(true);
     }
-    setPromptHistory((current) => {
-      const next = [normalizedInput, ...current.filter((entry) => entry !== normalizedInput)].slice(0, MAX_PROMPT_HISTORY);
-      localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(next));
-      return next;
-    });
+    if (normalizedInput !== "resume_baseline_planning") {
+      setPromptHistory((current) => {
+        const next = [normalizedInput, ...current.filter((entry) => entry !== normalizedInput)].slice(0, MAX_PROMPT_HISTORY);
+        localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(next));
+        return next;
+      });
+    }
     setPromptHistoryIndex(null);
     setPromptDraftBeforeHistory("");
 
@@ -1204,46 +1250,46 @@ export function App() {
       const sessionId = canReuseSession
         ? runtimeSession.id
         : await (async () => {
-            await assertRuntimeAvailable();
-            setRuntimeConnectionState("connected");
-            const trustProfile = accessProfile === "auto_review" || accessProfile === "bounded_autonomy" || accessProfile === "full_access" ? "trusted_internal" : "strict_gated";
-            const rustRun = await createRuntimeRun(input, trustProfile);
-            sessionToken = rustRun.sessionToken;
-            sessionTokenExpiresAt = rustRun.sessionTokenExpiresAt;
-            setRuntimeSessionToken(rustRun.sessionToken);
-            const sanitizedProvider =
-              providerConfig
-                ? {
-                    providerType: providerConfig.providerType,
-                    providerName: providerConfig.providerName,
-                     baseUrl: providerConfig.baseUrl,
-                     selectedModel: providerConfig.selectedModel,
-                     routerModel: providerConfig.routerModel,
-                     verifierModel: providerConfig.verifierModel,
-                     embeddingModel: providerConfig.embeddingModel,
-                    isValid: providerConfig.isValid,
-                    apiKeyConfigured: providerConfig.apiKeyConfigured
-                  }
-                : undefined;
-            if (!sanitizedProvider?.isValid) {
-              throw new Error("Configure a valid model provider before starting a coding run.");
-            }
-            return (
-              await createRuntimeSession({
-                workspacePath: workspace.path,
-                trustProfile,
-                providerConfig: sanitizedProvider,
-                activeProviderSource: "desktop_saved_provider",
-                sessionToken: rustRun.sessionToken,
-                sessionTokenExpiresAt: rustRun.sessionTokenExpiresAt,
-                executionMode: "auto_mode",
-                accessProfile,
-                thinkFirst,
-                safetySettings,
-                userPrompt: input
-              })
-            ).sessionId;
-          })();
+          await assertRuntimeAvailable();
+          setRuntimeConnectionState("connected");
+          const trustProfile = accessProfile === "auto_review" || accessProfile === "bounded_autonomy" || accessProfile === "full_access" ? "trusted_internal" : "strict_gated";
+          const rustRun = await createRuntimeRun(input, trustProfile);
+          sessionToken = rustRun.sessionToken;
+          sessionTokenExpiresAt = rustRun.sessionTokenExpiresAt;
+          setRuntimeSessionToken(rustRun.sessionToken);
+          const sanitizedProvider =
+            providerConfig
+              ? {
+                providerType: providerConfig.providerType,
+                providerName: providerConfig.providerName,
+                baseUrl: providerConfig.baseUrl,
+                selectedModel: providerConfig.selectedModel,
+                routerModel: providerConfig.routerModel,
+                verifierModel: providerConfig.verifierModel,
+                embeddingModel: providerConfig.embeddingModel,
+                isValid: providerConfig.isValid,
+                apiKeyConfigured: providerConfig.apiKeyConfigured
+              }
+              : undefined;
+          if (!sanitizedProvider?.isValid) {
+            throw new Error("Configure a valid model provider before starting a coding run.");
+          }
+          return (
+            await createRuntimeSession({
+              workspacePath: workspace.path,
+              trustProfile,
+              providerConfig: sanitizedProvider,
+              activeProviderSource: "desktop_saved_provider",
+              sessionToken: rustRun.sessionToken,
+              sessionTokenExpiresAt: rustRun.sessionTokenExpiresAt,
+              executionMode: "auto_mode",
+              accessProfile,
+              thinkFirst,
+              safetySettings,
+              userPrompt: input
+            })
+          ).sessionId;
+        })();
       activeSessionIdForReconcile = sessionId;
       activeSessionTokenForReconcile = sessionToken;
       if (sessionToken && sessionTokenExpiresAt) {
@@ -1252,14 +1298,17 @@ export function App() {
       subscribeToRuntimeSession(sessionId, sessionToken);
       await reconcileRuntimeSession(sessionId, sessionToken, "session_created");
       setPrompt("");
-      await runRuntimeTurn(sessionId, input, sessionToken);
+      await runRuntimeTurn(sessionId, input, sessionToken, { thinkFirst });
       const nextSession = await reconcileRuntimeSession(sessionId, sessionToken, "turn_completed");
+      if (nextSession && typeof nextSession.thinkFirst === "boolean") {
+        setThinkFirst(nextSession.thinkFirst);
+      }
       await refreshWorkspaceState();
       setMessage(
         queuedMode === "steer"
           ? "Steer request completed."
           : nextSession?.nextAction?.message ??
-            (nextSession?.status === "needs_approval" ? "Session is waiting for operator review." : "Session updated.")
+          (nextSession?.status === "needs_approval" ? "Session is waiting for operator review." : "Session updated.")
       );
     } catch (error) {
       if (error instanceof RuntimeUnavailableError) {
@@ -1302,6 +1351,7 @@ export function App() {
 
   async function handleApprovePatch(patchId: string) {
     if (!runtimeSession) return;
+    let rustApplyResult: Awaited<ReturnType<typeof applyRuntimePatch>> | undefined;
     try {
       const result = await approveRuntimePatch(runtimeSession.id, patchId, runtimeSessionToken || undefined);
       await persistPatchApprovalForRust(runtimeSession.id, result.proposal);
@@ -1313,6 +1363,7 @@ export function App() {
       );
       applyCanonicalRuntimeSession(applying);
       const applied = await applyRuntimePatchWithRetry(runtimeSession.id, patchId);
+      rustApplyResult = applied;
       const updated = await reportRuntimePatchApplyResult(
         runtimeSession.id,
         patchId,
@@ -1322,9 +1373,9 @@ export function App() {
           reconciliationSnapshot:
             applied.beforeSnapshot || applied.afterSnapshot
               ? {
-                  before: applied.beforeSnapshot,
-                  after: applied.afterSnapshot
-                }
+                before: applied.beforeSnapshot,
+                after: applied.afterSnapshot
+              }
               : undefined
         },
         runtimeSessionToken || undefined
@@ -1334,6 +1385,11 @@ export function App() {
       await reconcileRuntimeSession(runtimeSession.id, runtimeSessionToken || undefined, "patch_apply_result");
       await refreshWorkspaceState();
     } catch (error) {
+      if (rustApplyResult?.status === "applied") {
+        await refreshRuntimeSession();
+        setMessage(`Rust applied the patch, but a later UI refresh/reporting step failed: ${String(error)}`);
+        return;
+      }
       try {
         const updated = await reportRuntimePatchApplyResult(
           runtimeSession.id,
@@ -1385,6 +1441,7 @@ export function App() {
 
   async function handleApplyPatch(patchId: string) {
     if (!runtimeSession) return;
+    let rustApplyResult: Awaited<ReturnType<typeof applyRuntimePatch>> | undefined;
     try {
       const proposal = runtimeSession.patchProposals.find((candidate) => candidate.id === patchId);
       if (!proposal || proposal.status !== "approved") {
@@ -1399,6 +1456,7 @@ export function App() {
       );
       applyCanonicalRuntimeSession(applying);
       const applied = await applyRuntimePatchWithRetry(runtimeSession.id, patchId);
+      rustApplyResult = applied;
       const updated = await reportRuntimePatchApplyResult(
         runtimeSession.id,
         patchId,
@@ -1408,9 +1466,9 @@ export function App() {
           reconciliationSnapshot:
             applied.beforeSnapshot || applied.afterSnapshot
               ? {
-                  before: applied.beforeSnapshot,
-                  after: applied.afterSnapshot
-                }
+                before: applied.beforeSnapshot,
+                after: applied.afterSnapshot
+              }
               : undefined
         },
         runtimeSessionToken || undefined
@@ -1420,6 +1478,11 @@ export function App() {
       await reconcileRuntimeSession(runtimeSession.id, runtimeSessionToken || undefined, "patch_apply_result");
       await refreshWorkspaceState();
     } catch (error) {
+      if (rustApplyResult?.status === "applied") {
+        await refreshRuntimeSession();
+        setMessage(`Rust applied the patch, but a later UI refresh/reporting step failed: ${String(error)}`);
+        return;
+      }
       try {
         const updated = await reportRuntimePatchApplyResult(
           runtimeSession.id,
@@ -1440,8 +1503,9 @@ export function App() {
   async function handleRejectPatch(patchId: string) {
     if (!runtimeSession) return;
     try {
+      const rustResult = await rejectRuntimePatchViaRust(runtimeSession.id, patchId);
       const result = await rejectRuntimePatch(runtimeSession.id, patchId, runtimeSessionToken || undefined);
-      setMessage(result.message);
+      setMessage(result.message || rustResult.message);
       await refreshRuntimeSession();
     } catch (error) {
       setMessage(String(error));
@@ -1465,7 +1529,25 @@ export function App() {
         sessionToken: runtimeSessionToken || undefined
       });
       applyCanonicalRuntimeSession(execution.updatedSession);
-      await reconcileRuntimeSession(session.id, runtimeSessionToken || undefined, "command_result");
+      const canonical = await reconcileRuntimeSession(session.id, runtimeSessionToken || undefined, "command_result");
+      if (
+        canonical &&
+        canonical.nextAction?.kind === "await_baseline_command" &&
+        canonical.nextAction.commandRequestId === request.id &&
+        !baselineContinuationTriggeredRef.current.has(request.id)
+      ) {
+        const result = execution.result;
+        const hasValidEvidence =
+          result.status !== "blocked" &&
+          typeof result.exitCode === "number" &&
+          ((result.stdout?.length ?? 0) > 0 || (result.stderr?.length ?? 0) > 0) &&
+          result.diagnosis?.category !== "command_not_found";
+
+        if (hasValidEvidence) {
+          baselineContinuationTriggeredRef.current.add(request.id);
+          void submitPrompt("resume_baseline_planning");
+        }
+      }
       return execution.result;
     } catch (error) {
       await refreshRuntimeSession();
@@ -1519,6 +1601,7 @@ export function App() {
   function resetForNewChat(statusMessage: string) {
     runtimeEventUnsubscribeRef.current?.();
     runtimeEventUnsubscribeRef.current = null;
+    baselineContinuationTriggeredRef.current.clear();
     setPrompt("");
     setRuntimeSession(null);
     setRuntimeSessionToken("");
@@ -2164,6 +2247,9 @@ export function App() {
                     if (promptHistoryIndex !== null) {
                       setPromptHistoryIndex(null);
                     }
+                    if (isPreSessionErrorMessage(message)) {
+                      setMessage("");
+                    }
                   }}
                   onKeyDown={handlePromptKeyDown}
                   placeholder="Ask Hivo to create or edit a project with Ollama..."
@@ -2230,7 +2316,7 @@ export function App() {
               </div>
 
               <div className="composer-footer">
-                <button className="footer-pill" onClick={handleOpenWorkspace}>
+                <button className="footer-pill" onClick={handlePickWorkspace}>
                   <FolderOpen size={14} />
                   <span>{workspace?.name ?? "Open workspace"}</span>
                 </button>
@@ -2276,6 +2362,41 @@ export function App() {
                 </div>
               ) : null}
 
+              {preSessionErrorMessage ? (
+                <div
+                  className="full-access-banner pre-session-error-banner"
+                  style={{
+                    borderColor: "rgba(239, 68, 68, 0.35)",
+                    background: "rgba(239, 68, 68, 0.08)"
+                  }}
+                >
+                  <div style={{ display: "grid", gap: "4px" }}>
+                    <strong style={{ color: "#fca5a5" }}>Unable to start session</strong>
+                    <span style={{ color: "#fecaca" }}>{preSessionErrorMessage}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    {!providerConfig?.isValid ? (
+                      <button
+                        className="composer-chip"
+                        onClick={() => setSettingsOpen(true)}
+                        type="button"
+                        style={{ height: "26px", fontSize: "12px", padding: "0 8px" }}
+                      >
+                        Settings
+                      </button>
+                    ) : null}
+                    <button
+                      className="frame-icon-button"
+                      onClick={() => setMessage("")}
+                      title="Dismiss error notice"
+                      type="button"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
               {agentBusy || queuedPrompts.length ? (
                 <div className="queue-strip">
                   {agentBusy ? <span className="queue-pill">Working now</span> : null}
@@ -2293,7 +2414,16 @@ export function App() {
             {!runtimeSession ? (
               <div className="starter-list">
                 {starterPrompts.map((starter) => (
-                  <button key={starter} className="starter-row" onClick={() => setPrompt(starter)}>
+                  <button
+                    key={starter}
+                    className="starter-row"
+                    onClick={() => {
+                      setPrompt(starter);
+                      if (isPreSessionErrorMessage(message)) {
+                        setMessage("");
+                      }
+                    }}
+                  >
                     <Workflow size={15} />
                     <span>{starter}</span>
                   </button>
@@ -2435,11 +2565,11 @@ export function App() {
                   <dd>{sseConnectionState.tokenExpired ? "token_expired" : sseConnectionState.unauthorized ? "unauthorized" : "ok"}</dd>
                   <dt>Provider Source</dt>
                   <dd>{runtimeSession.providerTelemetry?.activeProviderSource ?? runtimeSession.activeProviderSource ?? "unknown"}</dd>
-                   <dt>Author Model</dt>
-                   <dd>{getProviderCertification(runtimeSession.providerTelemetry).authorModel}</dd>
-                   <dt>Router Model</dt>
-                   <dd>{getProviderCertification(runtimeSession.providerTelemetry).routerModel}</dd>
-                   <dt>Verifier Model</dt>
+                  <dt>Author Model</dt>
+                  <dd>{getProviderCertification(runtimeSession.providerTelemetry).authorModel}</dd>
+                  <dt>Router Model</dt>
+                  <dd>{getProviderCertification(runtimeSession.providerTelemetry).routerModel}</dd>
+                  <dt>Verifier Model</dt>
                   <dd>{getProviderCertification(runtimeSession.providerTelemetry).verifierModel}</dd>
                   <dt>Certification</dt>
                   <dd title={getProviderCertification(runtimeSession.providerTelemetry).reason}>
@@ -2453,14 +2583,14 @@ export function App() {
                   <dd>{runtimeSession.providerTelemetry?.repairAttempts ?? 0}</dd>
                   <dt>Tool Rounds</dt>
                   <dd>{runtimeSession.latestDecisionPipeline?.reasoningTrace?.toolRounds ?? 0}</dd>
-                   <dt>Evidence</dt>
-                   <dd>{getReasoningTraceSummary(runtimeSession).evidenceCount}</dd>
-                   <dt>Information Gain</dt>
-                   <dd>{getReasoningTraceSummary(runtimeSession).informationGain}</dd>
-                   <dt>Stagnant Rounds</dt>
-                   <dd>{getReasoningTraceSummary(runtimeSession).stagnantRounds}</dd>
-                   <dt>Index Readiness</dt>
-                   <dd>{getReasoningTraceSummary(runtimeSession).indexReadiness}</dd>
+                  <dt>Evidence</dt>
+                  <dd>{getReasoningTraceSummary(runtimeSession).evidenceCount}</dd>
+                  <dt>Information Gain</dt>
+                  <dd>{getReasoningTraceSummary(runtimeSession).informationGain}</dd>
+                  <dt>Stagnant Rounds</dt>
+                  <dd>{getReasoningTraceSummary(runtimeSession).stagnantRounds}</dd>
+                  <dt>Index Readiness</dt>
+                  <dd>{getReasoningTraceSummary(runtimeSession).indexReadiness}</dd>
                   <dt>Context Omissions</dt>
                   <dd>{getReasoningTraceSummary(runtimeSession).contextOmissions}</dd>
                   <dt>Verifier Verdict</dt>
@@ -2767,6 +2897,7 @@ function FactoryApprovalCard({
   );
 }
 
+
 function RecursiveGraphCard({ session }: { session: AgentRuntimeSession }) {
   const graph = session.recursiveFactory?.recursiveGraph;
   const branchExecutions = session.recursiveFactory?.branchExecutions ?? [];
@@ -3013,7 +3144,7 @@ function ThreadFeed({
   const currentActivityStep = describeCurrentStep(session, connectionState, activeRuntimeCommand);
   const workspaceMismatch = Boolean(
     activeWorkspacePath
-      && normalizeWorkspacePath(activeWorkspacePath) !== normalizeWorkspacePath(session.workspacePath)
+    && normalizeWorkspacePath(activeWorkspacePath) !== normalizeWorkspacePath(session.workspacePath)
   );
   const animatedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
   const threadFeedRef = useRef<HTMLDivElement | null>(null);
@@ -3950,6 +4081,24 @@ function PrimaryActionCard({
     );
   }
 
+  if (session.nextAction?.kind === "await_baseline_command") {
+    return (
+      <ActionCard
+        title="Baseline test command"
+        message={session.nextAction.message}
+        actions={
+          <>
+            <button onClick={onRunPendingCommands}>
+              <Play size={14} />
+              Run in Rust
+            </button>
+            <button onClick={onOpenActivity}>Details</button>
+          </>
+        }
+      />
+    );
+  }
+
   return null;
 }
 
@@ -4698,104 +4847,104 @@ function AgentPanelOverlay({
     <aside className="agent-panel-overlay">
       <div className="agent-panel-backdrop" onClick={onClose} />
       <section className="activity-drawer agent-side-panel">
-      <div className="agent-side-panel-header">
-        <div>
-          <strong>Agents</strong>
-          <span>{agents.length} active worker{agents.length === 1 ? "" : "s"}</span>
-        </div>
-        <div className="agent-side-panel-actions">
-          <button className="activity-link" onClick={onOpenDiff}>Review changes</button>
-          <button className="frame-icon-button" onClick={onClose} title="Close agent panel">
-            <X size={15} />
-          </button>
-        </div>
-      </div>
-
-      <div className="agent-side-tab-row">
-        {agents.map((agent) => (
-          <button
-            key={agent.id}
-            className={`agent-side-tab ${selectedAgent?.id === agent.id ? "selected" : ""} ${agent.status}`}
-            onClick={() => onSelectAgent(agent.id)}
-            type="button"
-            title={`${agent.name} | ${humanizeAgentStatus(agent.status)}`}
-          >
-            <span className="agent-side-color" style={{ "--agent-color": agent.color } as CSSProperties} />
-            <strong>{agent.name}</strong>
-          </button>
-        ))}
-      </div>
-
-      {selectedAgent ? (
-        <div className="agent-side-thread">
-          <div className="agent-side-summary">
-            <strong>{selectedAgent.name}</strong>
-            <span>{selectedAgent.role} | {selectedAgent.currentAction}</span>
+        <div className="agent-side-panel-header">
+          <div>
+            <strong>Agents</strong>
+            <span>{agents.length} active worker{agents.length === 1 ? "" : "s"}</span>
           </div>
-          <div className="agent-side-update-list">
-            {updates.map((update) => (
-              <div key={update.id} className={`agent-side-update ${update.status}`}>
-                <div className={`agent-side-status ${update.status}`} />
+          <div className="agent-side-panel-actions">
+            <button className="activity-link" onClick={onOpenDiff}>Review changes</button>
+            <button className="frame-icon-button" onClick={onClose} title="Close agent panel">
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+
+        <div className="agent-side-tab-row">
+          {agents.map((agent) => (
+            <button
+              key={agent.id}
+              className={`agent-side-tab ${selectedAgent?.id === agent.id ? "selected" : ""} ${agent.status}`}
+              onClick={() => onSelectAgent(agent.id)}
+              type="button"
+              title={`${agent.name} | ${humanizeAgentStatus(agent.status)}`}
+            >
+              <span className="agent-side-color" style={{ "--agent-color": agent.color } as CSSProperties} />
+              <strong>{agent.name}</strong>
+            </button>
+          ))}
+        </div>
+
+        {selectedAgent ? (
+          <div className="agent-side-thread">
+            <div className="agent-side-summary">
+              <strong>{selectedAgent.name}</strong>
+              <span>{selectedAgent.role} | {selectedAgent.currentAction}</span>
+            </div>
+            <div className="agent-side-update-list">
+              {updates.map((update) => (
+                <div key={update.id} className={`agent-side-update ${update.status}`}>
+                  <div className={`agent-side-status ${update.status}`} />
+                  <div>
+                    <strong>{update.title}</strong>
+                    <span>{update.summary}</span>
+                    {update.meta ? <small>{update.meta}</small> : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="agent-side-footer">
+              <span>{selectedAgent.diffLabel}</span>
+              <span>{selectedAgent.commandsRun.length ? `Ran ${selectedAgent.commandsRun.length} command(s)` : "No commands yet"}</span>
+            </div>
+
+            <details className="agent-side-details">
+              <summary>Show more</summary>
+              <div className="agent-side-details-grid">
                 <div>
-                  <strong>{update.title}</strong>
-                  <span>{update.summary}</span>
-                  {update.meta ? <small>{update.meta}</small> : null}
+                  <strong>Objective</strong>
+                  <span>{selectedAgent.objective}</span>
+                </div>
+                <div>
+                  <strong>Agent trace</strong>
+                  <span>{selectedAgent.assignedPrompt ?? "Assigned prompt is not reported yet."}</span>
+                </div>
+                <div>
+                  <strong>Tasks</strong>
+                  <span>{selectedAgent.tasks.length ? selectedAgent.tasks.join(" | ") : "Not reported yet."}</span>
+                </div>
+                <div>
+                  <strong>Target files</strong>
+                  <span>{selectedAgent.targetFiles.length ? selectedAgent.targetFiles.join(", ") : "Not reported yet."}</span>
+                </div>
+                <div>
+                  <strong>Changed files</strong>
+                  <span>{selectedAgent.changedFiles.length ? selectedAgent.changedFiles.join(", ") : "Not reported yet."}</span>
+                </div>
+                <div>
+                  <strong>Recent actions</strong>
+                  <span>{selectedAgent.recentActions.length ? selectedAgent.recentActions.join(" | ") : "Not reported yet."}</span>
+                </div>
+              </div>
+            </details>
+          </div>
+        ) : null}
+
+        {backgroundJobs?.length ? (
+          <section className="agent-background-jobs">
+            <div className="drawer-section-title">Background jobs</div>
+            {backgroundJobs.slice(-4).map((job) => (
+              <div key={job.jobId} className="agent-side-update running">
+                <div className="agent-side-status running" />
+                <div>
+                  <strong>{job.command}</strong>
+                  <span>{job.status} | {job.cwd}</span>
                 </div>
               </div>
             ))}
-          </div>
-
-          <div className="agent-side-footer">
-            <span>{selectedAgent.diffLabel}</span>
-            <span>{selectedAgent.commandsRun.length ? `Ran ${selectedAgent.commandsRun.length} command(s)` : "No commands yet"}</span>
-          </div>
-
-          <details className="agent-side-details">
-            <summary>Show more</summary>
-            <div className="agent-side-details-grid">
-              <div>
-                <strong>Objective</strong>
-                <span>{selectedAgent.objective}</span>
-              </div>
-              <div>
-                <strong>Agent trace</strong>
-                <span>{selectedAgent.assignedPrompt ?? "Assigned prompt is not reported yet."}</span>
-              </div>
-              <div>
-                <strong>Tasks</strong>
-                <span>{selectedAgent.tasks.length ? selectedAgent.tasks.join(" | ") : "Not reported yet."}</span>
-              </div>
-              <div>
-                <strong>Target files</strong>
-                <span>{selectedAgent.targetFiles.length ? selectedAgent.targetFiles.join(", ") : "Not reported yet."}</span>
-              </div>
-              <div>
-                <strong>Changed files</strong>
-                <span>{selectedAgent.changedFiles.length ? selectedAgent.changedFiles.join(", ") : "Not reported yet."}</span>
-              </div>
-              <div>
-                <strong>Recent actions</strong>
-                <span>{selectedAgent.recentActions.length ? selectedAgent.recentActions.join(" | ") : "Not reported yet."}</span>
-              </div>
-            </div>
-          </details>
-        </div>
-      ) : null}
-
-      {backgroundJobs?.length ? (
-        <section className="agent-background-jobs">
-          <div className="drawer-section-title">Background jobs</div>
-          {backgroundJobs.slice(-4).map((job) => (
-            <div key={job.jobId} className="agent-side-update running">
-              <div className="agent-side-status running" />
-              <div>
-                <strong>{job.command}</strong>
-                <span>{job.status} | {job.cwd}</span>
-              </div>
-            </div>
-          ))}
-        </section>
-      ) : null}
+          </section>
+        ) : null}
       </section>
     </aside>
   );
@@ -5332,14 +5481,14 @@ function WorkingTeamCard({
   const statuses: AgentWorkStatus[] = session.agentWorkStatuses.length
     ? session.agentWorkStatuses
     : (session.orchestration?.workOrders ?? []).map((order) => ({
-        agentName: order.agentName,
-        role: order.dynamicRole,
-        taskTitle: order.objective,
-        objective: order.objective,
-        status: "queued" as const,
-        targetFiles: order.requiredArtifacts,
-        updatedAt: new Date().toISOString()
-      }));
+      agentName: order.agentName,
+      role: order.dynamicRole,
+      taskTitle: order.objective,
+      objective: order.objective,
+      status: "queued" as const,
+      targetFiles: order.requiredArtifacts,
+      updatedAt: new Date().toISOString()
+    }));
   if (!statuses.length) return null;
   return (
     <section className="run-card">
@@ -5884,8 +6033,8 @@ function buildAgentTraceEntries(
     title: entry.title,
     summary: entry.summary,
     meta: entry.filePath ? entry.filePath : entry.command ? entry.command : undefined,
-      status: mapJournalStatus(entry.status) as "running" | "completed" | "blocked" | "failed"
-    }));
+    status: mapJournalStatus(entry.status) as "running" | "completed" | "blocked" | "failed"
+  }));
   const handoffEntries = handoffs.flatMap((handoff) =>
     handoff.details.map((detail, index) => ({
       id: `${handoff.id}-${index}`,
@@ -6111,6 +6260,8 @@ function humanSessionStatus(
       return "Preview available";
     case "approve_commands":
       return "Waiting on command approval";
+    case "await_baseline_command":
+      return "Waiting on baseline command";
     default:
       break;
   }
@@ -6141,6 +6292,9 @@ function describeOperatorHeadline(session: AgentRuntimeSession, connectionState:
   }
   if (session.nextAction?.kind === "approve_commands") {
     return "Runtime commands are queued and waiting for operator execution.";
+  }
+  if (session.nextAction?.kind === "await_baseline_command") {
+    return "A baseline test command must run to ground planning evidence.";
   }
   if (session.status === "blocked" || session.lifecycleStage === "BLOCKED") {
     return session.runToGreen?.blockerReason ?? "The run needs attention before it can continue.";
@@ -6896,16 +7050,16 @@ function SettingsDialog({
   const [form, setForm] = useState<ModelProviderConfigInput>(() =>
     currentConfig
       ? {
-          id: currentConfig.id,
-          providerType: currentConfig.providerType,
-          providerName: currentConfig.providerName,
-          baseUrl: currentConfig.baseUrl,
-          selectedModel: currentConfig.selectedModel,
-          routerModel: currentConfig.routerModel ?? "",
-          verifierModel: currentConfig.verifierModel ?? "",
-          embeddingModel: currentConfig.embeddingModel ?? "",
-          apiKey: ""
-        }
+        id: currentConfig.id,
+        providerType: currentConfig.providerType,
+        providerName: currentConfig.providerName,
+        baseUrl: currentConfig.baseUrl,
+        selectedModel: currentConfig.selectedModel,
+        routerModel: currentConfig.routerModel ?? "",
+        verifierModel: currentConfig.verifierModel ?? "",
+        embeddingModel: currentConfig.embeddingModel ?? "",
+        apiKey: ""
+      }
       : defaultProviderForm
   );
   const [models, setModels] = useState<ModelInfo[]>([]);

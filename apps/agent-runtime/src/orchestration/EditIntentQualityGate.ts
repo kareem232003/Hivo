@@ -138,7 +138,7 @@ export function evaluateEditIntentQuality(input: QualityGateInput): EditIntentQu
 
   // 3. Has some concrete edit info (symbol, exactOldText, or anchorLine)
   const hasSymbol = !!editIntent.target_symbol_or_range;
-  const hasOldText = hasExactText(builderOverrides);
+  const hasOldText = hasExactText(builderOverrides) || (typeof (editIntent as Record<string, unknown>).exact_old_text === "string" && ((editIntent as Record<string, unknown>).exact_old_text as string).length > 0);
   const hasAnchorText = hasAnchor(builderOverrides);
   if (!hasSymbol && !hasOldText && !hasAnchorText) {
     missingFields.push("target_symbol_or_range_or_exact_old_text_or_anchor");
@@ -147,7 +147,7 @@ export function evaluateEditIntentQuality(input: QualityGateInput): EditIntentQu
   }
 
   // 4. Evidence refs for medium/high risk
-  const hasEvidence = editIntent.evidence_refs.length > 0 || (evidencePack?.evidence_refs?.length ?? 0) > 0;
+  const hasEvidence = (editIntent.evidence_refs?.length ?? 0) > 0 || (evidencePack?.evidence_refs?.length ?? 0) > 0;
   if (!hasEvidence && (editIntent.risk === "medium" || editIntent.risk === "high")) {
     missingFields.push("evidence_refs");
     risks.push(`Missing evidence for ${editIntent.risk} risk`);

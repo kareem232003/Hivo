@@ -70,6 +70,13 @@ export class RuntimeOrchestrationDispatchService {
         session: await input.branches.recursiveFactory()
       };
     }
+    const route = input.conversationUnderstanding?.routeDecision.route;
+    if (input.swarmMode === "recursive_tree" && route !== "swarm_readonly") {
+      return {
+        branch: "recursive_swarm",
+        session: await input.branches.recursiveSwarm()
+      };
+    }
     if (shouldUseProviderBackedSwarm(input)) {
       return {
         branch: "provider_backed_swarm",

@@ -659,6 +659,8 @@ export type AgentRuntimeSession = {
     expandedGoalSpec?: AgentRuntimeExpandedGoalSpec;
     budget?: AgentRuntimeRecursiveRunBudget;
     activityProjection?: AgentRuntimeActivityProjection;
+    planState?: "ready_to_implement" | "implemented";
+    stagedValidationCommands?: import("./models.js").CommandRequest[];
     checkpoint?: AgentRuntimeRecursiveRunCheckpoint;
     tree: {
       schemaVersion: number;
@@ -671,6 +673,7 @@ export type AgentRuntimeSession = {
       createdAt: string;
       updatedAt: string;
       nodes?: AgentRuntimeSwarmNode[];
+      rawNodes?: Record<string, unknown>;
     };
     createdAt: string;
     updatedAt: string;
@@ -712,6 +715,7 @@ export type CreateRuntimeSessionResponse = {
 
 export type RuntimeTurnRequest = {
   message: string;
+  thinkFirst?: boolean;
 };
 
 export type RuntimeTurnResponse = {

@@ -37,7 +37,10 @@ export class OpenAIProvider implements LlmProvider {
       throw new Error("OPENAI_API_KEY is not configured. Configure a real provider before starting a session.");
     }
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, input.timeoutMs ?? this.timeoutMs));
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.min(this.timeoutMs, input.timeoutMs ?? this.timeoutMs, input.providerRunBudget?.remainingMs() ?? this.timeoutMs)
+    );
     try {
       const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/v1/chat/completions`, {
         method: "POST",
@@ -98,7 +101,10 @@ export class OpenAIProvider implements LlmProvider {
     const model = input.model ?? this.embeddingModel;
     if (!model) throw new Error("openai_compatible.embedding_model_missing");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      Math.min(this.timeoutMs, input.timeoutMs ?? this.timeoutMs, input.providerRunBudget?.remainingMs() ?? this.timeoutMs)
+    );
     try {
       const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/v1/embeddings`, {
         method: "POST",

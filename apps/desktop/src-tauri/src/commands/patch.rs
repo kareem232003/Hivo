@@ -11,6 +11,14 @@ pub fn apply_runtime_patch(
     patch_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<PatchApplyResult, String> {
+    apply_runtime_patch_inner(session_id, patch_id, state.inner().as_ref())
+}
+
+fn apply_runtime_patch_inner(
+    session_id: String,
+    patch_id: String,
+    state: &AppState,
+) -> Result<PatchApplyResult, String> {
     let workspace_path = {
         let workspace = state
             .workspace
@@ -51,17 +59,17 @@ pub fn apply_runtime_patch(
     let (patch_text, files_changed) = match extract_patch_payload(&payload, &patch_id) {
         Ok(extracted) => extracted,
         Err(error) => {
-            record_apply_failure(&state, &session_id, &patch_id, &error)?;
+            record_apply_failure(state, &session_id, &patch_id, &error)?;
             return Err(error);
         }
     };
     if let Err(error) = state.patch.preflight_patch(&patch_text, &files_changed, &workspace_path) {
-        record_apply_failure(&state, &session_id, &patch_id, &error)?;
+        record_apply_failure(state, &session_id, &patch_id, &error)?;
         return Err(error);
     }
     let before_snapshot = state.git.snapshot(&workspace_path, "rust_git_snapshot");
     let apply_started_event_id = append_canonical_runtime_event(
-        &state,
+        state,
         &session_id,
         "patch.apply_started",
         &serde_json::json!({
@@ -75,7 +83,7 @@ pub fn apply_runtime_patch(
     )?;
 
     if let Err(err) = state.patch.apply_patch(&patch_text, &workspace_path) {
-        record_apply_failure(&state, &session_id, &patch_id, &err)?;
+        record_apply_failure(state, &session_id, &patch_id, &err)?;
         return Err(err);
     }
 
@@ -150,6 +158,14 @@ pub fn reject_runtime_patch(
     patch_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<PatchApplyResult, String> {
+    reject_runtime_patch_inner(session_id, patch_id, state.inner().as_ref())
+}
+
+fn reject_runtime_patch_inner(
+    session_id: String,
+    patch_id: String,
+    state: &AppState,
+) -> Result<PatchApplyResult, String> {
     let db = state
         .db
         .lock()
@@ -179,7 +195,7 @@ pub fn reject_runtime_patch(
 }
 
 fn record_apply_failure(
-    state: &State<'_, Arc<AppState>>,
+    state: &AppState,
     session_id: &str,
     patch_id: &str,
     error: &str,
@@ -216,7 +232,7 @@ fn record_apply_failure_locked(
 }
 
 fn append_canonical_runtime_event(
-    state: &State<'_, Arc<AppState>>,
+    state: &AppState,
     session_id: &str,
     event_type: &str,
     payload: &serde_json::Value,
@@ -252,4 +268,220 @@ fn append_canonical_runtime_event_locked(
         causation_id: None,
     })?;
     Ok(event_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_runtime_patch_inner, reject_runtime_patch_inner};
+    use crate::db::DatabaseService;
+    use crate::services::{
+        git::GitService, model_provider::ModelProviderService, patch::PatchService,
+        project_index::ProjectIndexService, terminal::TerminalService, workspace::WorkspaceService,
+    };
+    use crate::AppState;
+    use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    const ORIGINAL: &str = "function multiply(a, b) {\n  return a + b;\n}\n";
+    const PATCH: &str = "diff --git a/src/calculator.js b/src/calculator.js\n--- a/src/calculator.js\n+++ b/src/calculator.js\n@@ -1,3 +1,3 @@\n function multiply(a, b) {\n-  return a + b;\n+  return a * b;\n }\n";
+
+    #[test]
+    fn production_patch_commands_enforce_decisions_and_report_actual_results() {
+        let (workspace, state) = fixture("approved");
+        let session_id = "session_approved";
+        persist_proposal(&state, session_id, "patch_approved", PATCH);
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/calculator.js")).expect("read proposal source"),
+            ORIGINAL,
+            "a proposal must not mutate source"
+        );
+        append_approval(&state, session_id, "patch_approved");
+        let applied =
+            apply_runtime_patch_inner(session_id.to_string(), "patch_approved".to_string(), &state)
+                .expect("approved patch applies");
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.authority, "rust_patch_service");
+        assert_eq!(applied.reconciliation_source, "rust_git_snapshot");
+        assert!(applied
+            .before_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.available));
+        assert!(applied
+            .after_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.available));
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/calculator.js"))
+                .expect("read applied source")
+                .replace("\r\n", "\n"),
+            "function multiply(a, b) {\n  return a * b;\n}\n"
+        );
+        let events = state
+            .db
+            .lock()
+            .expect("database")
+            .list_runtime_events_for_session(session_id)
+            .expect("runtime events");
+        assert!(events
+            .iter()
+            .any(|event| event.payload_json.contains("\"status\":\"applied\"")));
+        let _ = fs::remove_dir_all(workspace);
+
+        let (workspace, state) = fixture("rejected");
+        let session_id = "session_rejected";
+        persist_proposal(&state, session_id, "patch_rejected", PATCH);
+        let rejected = reject_runtime_patch_inner(
+            session_id.to_string(),
+            "patch_rejected".to_string(),
+            &state,
+        )
+        .expect("Rust records rejection");
+        assert_eq!(rejected.status, "rejected");
+        assert!(apply_runtime_patch_inner(
+            session_id.to_string(),
+            "patch_rejected".to_string(),
+            &state,
+        )
+        .expect_err("rejected patch cannot apply")
+        .contains("patch_not_approved"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/calculator.js")).expect("read rejected source"),
+            ORIGINAL
+        );
+        let _ = fs::remove_dir_all(workspace);
+
+        let (workspace, state) = fixture("approve-reject");
+        let session_id = "session_approve_reject";
+        persist_proposal(&state, session_id, "patch_revoked", PATCH);
+        append_approval(&state, session_id, "patch_revoked");
+        reject_runtime_patch_inner(session_id.to_string(), "patch_revoked".to_string(), &state)
+            .expect("Rust records revocation");
+        assert!(apply_runtime_patch_inner(
+            session_id.to_string(),
+            "patch_revoked".to_string(),
+            &state,
+        )
+        .expect_err("later rejection revokes approval")
+        .contains("patch_not_approved"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/calculator.js")).expect("read revoked source"),
+            ORIGINAL
+        );
+        let _ = fs::remove_dir_all(workspace);
+
+        let (workspace, state) = fixture("stale");
+        let session_id = "session_stale";
+        let stale_patch = PATCH.replace("-  return a + b;", "-  return a - b;");
+        persist_proposal(&state, session_id, "patch_stale", &stale_patch);
+        append_approval(&state, session_id, "patch_stale");
+        assert!(apply_runtime_patch_inner(
+            session_id.to_string(),
+            "patch_stale".to_string(),
+            &state,
+        )
+        .expect_err("stale approved patch is rejected")
+        .contains("patch_invalid_apply_check_failed"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/calculator.js")).expect("read stale source"),
+            ORIGINAL
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    fn fixture(label: &str) -> (PathBuf, AppState) {
+        let workspace =
+            std::env::temp_dir().join(format!("hivo-desktop-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(workspace.join("src")).expect("create fixture");
+        fs::write(workspace.join("src/calculator.js"), ORIGINAL).expect("write calculator");
+        run_git(&workspace, &["init"]);
+        run_git(&workspace, &["config", "user.email", "hivo@example.com"]);
+        run_git(&workspace, &["config", "user.name", "Hivo Test"]);
+        run_git(&workspace, &["add", "src/calculator.js"]);
+        run_git(&workspace, &["commit", "-m", "seed calculator"]);
+
+        let mut workspace_service = WorkspaceService::new();
+        workspace_service
+            .open_workspace(
+                workspace.to_str().expect("workspace path"),
+                "fixture".to_string(),
+            )
+            .expect("open fixture workspace");
+        let db = DatabaseService::new_in_memory().expect("isolated database");
+        let state = AppState {
+            workspace: Mutex::new(workspace_service),
+            db: Mutex::new(db),
+            git: GitService::new(),
+            terminal: TerminalService::new(),
+            patch: PatchService::new(),
+            index: ProjectIndexService::new(),
+            model_provider: ModelProviderService::new(),
+        };
+        (workspace, state)
+    }
+
+    fn persist_proposal(state: &AppState, session_id: &str, patch_id: &str, patch: &str) {
+        let db = state.db.lock().expect("database");
+        db.create_orchestration_run(
+            session_id,
+            "Fix calculator multiplication",
+            "running",
+            "standard",
+            "fixture-token",
+            "2099-01-01T00:00:00Z",
+        )
+        .expect("create isolated session");
+        db.append_session_event(
+            session_id,
+            "runtime.patch.proposed",
+            &json!({
+                "proposal": {
+                    "id": patch_id,
+                    "title": "Fix multiplication",
+                    "filesChanged": [{
+                        "path": "src/calculator.js",
+                        "changeType": "modify",
+                        "explanation": "Correct the multiplication operator."
+                    }],
+                    "unifiedDiff": patch,
+                    "status": "proposed"
+                }
+            })
+            .to_string(),
+        )
+        .expect("persist proposal through production event format");
+    }
+
+    fn append_approval(state: &AppState, session_id: &str, patch_id: &str) {
+        state
+            .db
+            .lock()
+            .expect("database")
+            .append_session_event(
+                session_id,
+                "runtime.patch.approved",
+                &json!({
+                    "patchId": patch_id,
+                    "status": "approved"
+                })
+                .to_string(),
+            )
+            .expect("persist explicit user approval");
+    }
+
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

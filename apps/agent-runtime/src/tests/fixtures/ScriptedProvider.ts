@@ -60,6 +60,9 @@ export class ScriptedProvider implements LlmProvider {
     if (schemaName === "semantic_conflict_resolution") {
       return { decisions: [] } as T;
     }
+    if (schemaName === "swarm_planner_output") {
+      return this.createSwarmPlannerOutput(input) as T;
+    }
     if (schemaName === "parsed-agent-output") {
       return this.createParsedAgentOutput(input) as T;
     }
@@ -180,8 +183,8 @@ export class ScriptedProvider implements LlmProvider {
     const mode = /\b(create|new|scaffold|generate|make a new)\b/i.test(request) || /(أنشئ|انشئ|اعمل).*(مشروع|تطبيق|app|project)/.test(request)
       ? "create_project"
       : (/\b(run|launch|start|serve|open)\b.+\b(project|app|preview|site|game)\b/i.test(request) ||
-          (/(شغل|افتح).*(المشروع|التطبيق|اللعبة|project|app|game)/i.test(request)) ||
-          ((/\b(explain|inspect|analyze)\b/i.test(request) || /(اشرح|حلل|افهم|لخص|راجع)/.test(request)) && !(/\b(change|edit|fix|add|create|write|make)\b/i.test(request) || /(غيّر|غير|عدّل|عدل|صلح|أصلح|اضف|أضف|اكتب|اعمل|أنشئ|انشئ)/.test(request))))
+        (/(شغل|افتح).*(المشروع|التطبيق|اللعبة|project|app|game)/i.test(request)) ||
+        ((/\b(explain|inspect|analyze)\b/i.test(request) || /(اشرح|حلل|افهم|لخص|راجع)/.test(request)) && !(/\b(change|edit|fix|add|create|write|make)\b/i.test(request) || /(غيّر|غير|عدّل|عدل|صلح|أصلح|اضف|أضف|اكتب|اعمل|أنشئ|انشئ)/.test(request))))
         ? "inspect_only"
         : "edit_project";
     const requestedCount = Number(request.match(/\buse\s+(\d+)\s+agents?\b/i)?.[1] ?? "1");
@@ -348,27 +351,27 @@ export class ScriptedProvider implements LlmProvider {
       },
       step: needsWorkspace && intentKind === "workspace_question"
         ? {
-            id: "scripted_initial_investigation",
-            kind: "tool_batch",
-            rationale: "Scripted provider requested read-only workspace evidence before answering.",
-            toolRequests: [{
-              id: "scripted_investigate_project",
-              kind: "investigate_project",
-              query: route.workspacePrompt || request,
-              limit: 8,
-              reason: "Collect bounded workspace evidence for the provider-authored answer."
-            }],
-            missingFacts: ["Workspace evidence for the requested explanation."],
-            successCriteria: ["Answer only from cited workspace evidence."]
-          }
+          id: "scripted_initial_investigation",
+          kind: "tool_batch",
+          rationale: "Scripted provider requested read-only workspace evidence before answering.",
+          toolRequests: [{
+            id: "scripted_investigate_project",
+            kind: "investigate_project",
+            query: route.workspacePrompt || request,
+            limit: 8,
+            reason: "Collect bounded workspace evidence for the provider-authored answer."
+          }],
+          missingFacts: ["Workspace evidence for the requested explanation."],
+          successCriteria: ["Answer only from cited workspace evidence."]
+        }
         : {
-            id: "scripted_initial_step",
-            kind: "final",
-            rationale: "Scripted provider selected the deterministic fixture route.",
-            toolRequests: [],
-            missingFacts: [],
-            successCriteria: ["Continue through the selected runtime path."]
-          }
+          id: "scripted_initial_step",
+          kind: "final",
+          rationale: "Scripted provider selected the deterministic fixture route.",
+          toolRequests: [],
+          missingFacts: [],
+          successCriteria: ["Continue through the selected runtime path."]
+        }
     };
   }
 
@@ -426,12 +429,12 @@ export class ScriptedProvider implements LlmProvider {
       answerMarkdown: directAnswerMarkdown(extractReasoningUserTurn(input.userPrompt), language),
       claims: evidenceRefs.length
         ? [{
-            id: "scripted_claim_1",
-            text: "The scripted provider completed the schema-valid response using supplied evidence.",
-            material: false,
-            evidenceIds: evidenceRefs,
-            confidence: "medium"
-          }]
+          id: "scripted_claim_1",
+          text: "The scripted provider completed the schema-valid response using supplied evidence.",
+          material: false,
+          evidenceIds: evidenceRefs,
+          confidence: "medium"
+        }]
         : [],
       evidenceRefs,
       unknowns: [],
@@ -479,6 +482,19 @@ export class ScriptedProvider implements LlmProvider {
       intent_alignment: intentAlignmentFromContext(input.context)
     };
   }
+
+  private createSwarmPlannerOutput(input: LlmRequest) {
+    return {
+      plan_summary: `Plan created for: ${input.userPrompt.slice(0, 100)}`,
+      task_drafts: ["Analyze repository structure", "Implement proposed change", "Run validation suite"],
+      dependencies: ["package.json"],
+      risks: [],
+      validation_strategy: ["npm test"],
+      assumptions: ["Repository dependencies are installed"],
+      confidence: 0.9,
+      intent_alignment: intentAlignmentFromContext(input.context)
+    };
+  }
 }
 
 function deterministicVector(text: string) {
@@ -489,7 +505,7 @@ function deterministicVector(text: string) {
 }
 
 function extractUserRequest(prompt: string) {
-  const match = prompt.match(/User request:\s*([\s\S]*?)(?:\n(?:Workspace snapshot|Plan):|$)/i);
+  const match = prompt.match(/User request:\s*([\s\S]*?)(?:\n(?:Unified intent understanding|Workspace snapshot|Plan):|$)/i);
   return (match?.[1] ?? prompt).trim();
 }
 

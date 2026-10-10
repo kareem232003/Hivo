@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { RecursiveTaskSplitter } from "../orchestration/RecursiveTaskSplitter.js";
 import { HierarchicalCollector } from "../orchestration/HierarchicalCollector.js";
@@ -51,21 +54,31 @@ type AtomicityFixture = {
   score: number;
   rationale: string;
   failures: string[];
+  recommendation?: "split" | "execute" | "block" | "escalate";
 };
 
 type SplitFixture = {
   rationale: string;
   subTasks: Array<{
+    id?: string;
     title: string;
     taskPrompt: string;
     expectedOutput: string;
     dependencies: string[];
+    responsibility?: import("../orchestration/RecursiveSwarmModels.js").WorkerResponsibility;
+    canWrite?: boolean;
+    sourceEvidenceRequirement?: {
+      prerequisiteSubtaskId: string;
+      sourcePath: string;
+      evidenceType: "verified_workspace_source";
+    };
   }>;
 };
 
 function recursiveProvider(input: {
   atomicity?: AtomicityFixture[];
   splitResults?: SplitFixture[];
+  structuredNodeOutput?: (request: LlmRequest) => unknown;
 } = {}): LlmProvider & { requests: LlmRequest[] } {
   const atomicity = [...(input.atomicity ?? [{ isAtomic: true, score: 2, rationale: "Atomic fixture.", failures: [] }])];
   const splitResults = [...(input.splitResults ?? [])];
@@ -96,6 +109,9 @@ function recursiveProvider(input: {
         return (splitResults.shift() ?? { subTasks: [], rationale: "No fixture split." }) as T;
       }
       if (name === "structured_node_output") {
+        if (input.structuredNodeOutput) {
+          return input.structuredNodeOutput(request) as T;
+        }
         return {
           kind: "final_summary",
           summary: `Completed: ${request.userPrompt}`,
@@ -485,6 +501,456 @@ test("executeChildren enforces dependency order with index refs", async () => {
   }
 });
 
+test("implementation waits for verified source evidence from its declared prerequisite", async () => {
+  const targetPath = "src/elements/element.bar.js";
+  const implementationMarker = "IMPLEMENT_REQUIRES_VERIFIED_BAR_SOURCE";
+  const workspacePath = mkdtempSync(path.join(tmpdir(), "hivo-source-evidence-missing-"));
+  let implementationCalls = 0;
+  let recoveryCalls = 0;
+  const provider = recursiveProvider({
+    atomicity: [
+      { isAtomic: false, score: 6, rationale: "Root should split.", failures: ["multiple_goals"] },
+      { isAtomic: true, score: 2, rationale: "Inspection task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Implementation task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Independent task is atomic.", failures: [] }
+    ],
+    splitResults: [{
+      rationale: "Inspect source before implementing, with one independent task.",
+      subTasks: [
+        {
+          id: "S0",
+          title: "Inspect bar source evidence",
+          taskPrompt: `Inspect ${targetPath} and return source evidence.`,
+          expectedOutput: "Source evidence for the bar element",
+          dependencies: []
+        },
+        {
+          id: "S1",
+          title: "Implement bar fix",
+          taskPrompt: `${implementationMarker}: Do not implement unless verified source content for ${targetPath} is available.`,
+          expectedOutput: `Patch grounded in verified ${targetPath} source`,
+          dependencies: ["0"],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "0",
+            sourcePath: targetPath,
+            evidenceType: "verified_workspace_source"
+          }
+        },
+        {
+          title: "Independent documentation check",
+          taskPrompt: "Perform this independent documentation check.",
+          expectedOutput: "Documentation check result",
+          dependencies: []
+        }
+      ]
+    }],
+    structuredNodeOutput: (request) => {
+      if (request.userPrompt.includes(implementationMarker)) {
+        implementationCalls++;
+        if (request.userPrompt.includes("previous response was structurally valid")) recoveryCalls++;
+      }
+      if (request.userPrompt.includes(`Inspect ${targetPath} and return source evidence.`)) {
+        return {
+          kind: "evidence_report",
+          findings: [`Inspected ${targetPath}`],
+          files: [targetPath],
+          symbols: ["BarElement"],
+          evidence_refs: [`file:${targetPath}#1-100`],
+          unknowns: [],
+          confidence: 0.99
+        };
+      }
+      return {
+        kind: "final_summary",
+        summary: "Task completed.",
+        blockers: [],
+        edit_intents: [],
+        validation_plans: [],
+        confidence: 0.9
+      };
+    }
+  });
+  const orchestrator = new RecursiveSwarmOrchestrator({
+    provider,
+    workspacePath,
+    options: {
+      maxDepth: 3,
+      maxAgents: 10,
+      enableGoalKeeper: false,
+      enableParallelExecution: false,
+      enableErrorRecovery: true
+    }
+  });
+
+  try {
+    const result = await orchestrator.run(
+      `Investigate ${targetPath} and implement the grounded fix, with an independent documentation check.`
+    );
+
+    assert.deepEqual(
+      { implementationCalls, recoveryCalls },
+      { implementationCalls: 0, recoveryCalls: 0 },
+      "Implementation and recovery must remain blocked when HIVO cannot independently verify the required workspace source"
+    );
+    const implementationNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Implement bar fix")
+    );
+    assert.ok(implementationNode);
+    assert.equal(implementationNode.status, "blocked");
+    assert.match(implementationNode.errorSummary ?? "", /evidence/i);
+    const independentNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Independent documentation check")
+    );
+    assert.ok(independentNode);
+    assert.equal(independentNode.status, "succeeded", "A missing evidence prerequisite must not block independent tasks");
+  } finally {
+    rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test("verified workspace source allows implementation and is included in worker context", async () => {
+  const targetPath = "src/elements/element.bar.js";
+  const sourceExcerpt = "export function drawBar() {\n  return 'real workspace source';\n}";
+  const implementationMarker = "IMPLEMENT_WITH_VERIFIED_BAR_SOURCE";
+  const workspacePath = mkdtempSync(path.join(tmpdir(), "hivo-source-evidence-present-"));
+  mkdirSync(path.dirname(path.join(workspacePath, targetPath)), { recursive: true });
+  writeFileSync(path.join(workspacePath, targetPath), sourceExcerpt, "utf8");
+  let implementationCalls = 0;
+  const provider = recursiveProvider({
+    atomicity: [
+      { isAtomic: false, score: 6, rationale: "Root should split.", failures: ["multiple_goals"] },
+      { isAtomic: true, score: 2, rationale: "Inspection task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Implementation task is atomic.", failures: [] }
+    ],
+    splitResults: [{
+      rationale: "Verify source then implement.",
+      subTasks: [
+        {
+          id: "inspect_bar_source",
+          title: "Inspect bar source evidence",
+          taskPrompt: `Inspect ${targetPath} and return source evidence.`,
+          expectedOutput: "Source evidence for the bar element",
+          dependencies: []
+        },
+        {
+          id: "implement_bar_fix",
+          title: "Implement bar fix",
+          taskPrompt: `${implementationMarker}: implement the grounded change.`,
+          expectedOutput: "Patch grounded in verified source",
+          dependencies: ["0"],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "inspect_bar_source",
+            sourcePath: targetPath,
+            evidenceType: "verified_workspace_source"
+          }
+        }
+      ]
+    }],
+    structuredNodeOutput: (request) => {
+      if (request.userPrompt.includes(implementationMarker)) implementationCalls++;
+      if (request.userPrompt.includes(`Inspect ${targetPath} and return source evidence.`)) {
+        return {
+          kind: "evidence_report",
+          findings: ["Source inspection complete."],
+          files: [targetPath],
+          symbols: [],
+          evidence_refs: ["worker-claim-only"],
+          unknowns: [],
+          confidence: 0.99
+        };
+      }
+      return {
+        kind: "final_summary",
+        summary: "Task completed.",
+        blockers: [],
+        edit_intents: [],
+        validation_plans: [],
+        confidence: 0.9
+      };
+    }
+  });
+  const orchestrator = new RecursiveSwarmOrchestrator({
+    provider,
+    workspacePath,
+    options: {
+      maxDepth: 3,
+      maxAgents: 10,
+      enableGoalKeeper: false,
+      enableParallelExecution: false,
+      enableErrorRecovery: false
+    }
+  });
+
+  try {
+    const result = await orchestrator.run(`Inspect ${targetPath} and implement the source-grounded fix.`);
+    const implementationNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Implement bar fix")
+    );
+    assert.ok(implementationNode);
+    assert.notEqual(implementationNode.status, "blocked");
+    assert.ok(implementationCalls > 0, "verified source should permit implementation provider execution");
+    const implementationRequests = provider.requests.filter((request) => request.userPrompt.includes(implementationMarker));
+    assert.ok(implementationRequests.some((request) =>
+      request.userPrompt.includes(sourceExcerpt)
+      && request.userPrompt.includes("Independently Verified Workspace Source")
+      && request.userPrompt.includes("SHA-256 of this bounded excerpt")
+      && request.userPrompt.includes("Source: src/elements/element.bar.js (workspace-relative, lines 1-3)")
+    ), "implementation context must contain actual source text and its verification provenance");
+  } finally {
+    rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test("successful summary prerequisite permits implementation only with independently verified source", async () => {
+  const targetPath = "src/elements/element.bar.js";
+  const implementationMarker = "IMPLEMENT_WITHOUT_PREREQUISITE_EVIDENCE";
+  const sourceExcerpt = "export const barSource = 'readable';";
+  const workspacePath = mkdtempSync(path.join(tmpdir(), "hivo-source-evidence-false-ready-"));
+  mkdirSync(path.dirname(path.join(workspacePath, targetPath)), { recursive: true });
+  writeFileSync(path.join(workspacePath, targetPath), `${sourceExcerpt}\n`, "utf8");
+  let implementationCalls = 0;
+  const provider = recursiveProvider({
+    atomicity: [
+      { isAtomic: false, score: 6, rationale: "Root should split.", failures: ["multiple_goals"] },
+      { isAtomic: true, score: 2, rationale: "Inspection task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Implementation task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Independent task is atomic.", failures: [] }
+    ],
+    splitResults: [{
+      rationale: "Inspect before implementation, alongside independent work.",
+      subTasks: [
+        {
+          id: "inspect_bar_source",
+          title: "Inspect bar source",
+          taskPrompt: `Inspect ${targetPath}.`,
+          expectedOutput: "Inspection outcome",
+          dependencies: []
+        },
+        {
+          id: "implement_bar_fix",
+          title: "Implement bar fix",
+          taskPrompt: implementationMarker,
+          expectedOutput: "Grounded implementation",
+          dependencies: ["0"],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "inspect_bar_source",
+            sourcePath: targetPath,
+            evidenceType: "verified_workspace_source"
+          }
+        },
+        {
+          id: "independent_check",
+          title: "Independent documentation check",
+          taskPrompt: "Perform the independent documentation check.",
+          expectedOutput: "Documentation check outcome",
+          dependencies: []
+        }
+      ]
+    }],
+    structuredNodeOutput: (request) => {
+      if (request.userPrompt.includes(implementationMarker)) {
+        implementationCalls++;
+      }
+      if (request.userPrompt.includes(`Inspect ${targetPath}.`)) {
+        return {
+          kind: "final_summary",
+          summary: "Inspection task completed without reading or reporting source evidence.",
+          blockers: [],
+          edit_intents: [],
+          validation_plans: [],
+          confidence: 0.9
+        };
+      }
+      return {
+        kind: "final_summary",
+        summary: "Task completed.",
+        blockers: [],
+        edit_intents: [],
+        validation_plans: [],
+        confidence: 0.9
+      };
+    }
+  });
+  const orchestrator = new RecursiveSwarmOrchestrator({
+    provider,
+    workspacePath,
+    options: {
+      maxDepth: 3,
+      maxAgents: 10,
+      enableGoalKeeper: false,
+      enableParallelExecution: false,
+      enableErrorRecovery: true
+    }
+  });
+
+  try {
+    const result = await orchestrator.run(
+      `Inspect ${targetPath}, implement only with prerequisite source evidence, and perform an independent documentation check.`
+    );
+    const inspectionNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Inspect bar source")
+    );
+    assert.ok(inspectionNode);
+    assert.equal(inspectionNode.status, "succeeded");
+    const implementationNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Implement bar fix")
+    );
+    assert.ok(implementationNode);
+    assert.ok(implementationCalls > 0, "a successful prerequisite plus independently verified workspace source may permit implementation");
+    assert.notEqual(implementationNode.status, "blocked");
+    const implementationRequests = provider.requests.filter((request) =>
+      request.userPrompt.includes(implementationMarker)
+    );
+    assert.ok(
+      implementationRequests.some((request) =>
+        request.userPrompt.includes(sourceExcerpt)
+        && request.userPrompt.includes("Independently Verified Workspace Source")
+        && request.userPrompt.includes("SHA-256 of this bounded excerpt")
+        && request.userPrompt.includes("Source: src/elements/element.bar.js (workspace-relative, lines 1-2)")
+      ),
+      "implementation provider input must contain actual independently read source and provenance"
+    );
+    const independentNode = Object.values(result.runState.tree.nodes).find((node) =>
+      node.name.includes("Independent documentation check")
+    );
+    assert.ok(independentNode);
+    assert.equal(independentNode.status, "succeeded");
+  } finally {
+    rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test("unresolved or undeclared source evidence prerequisites block implementation", async () => {
+  const workspacePath = mkdtempSync(path.join(tmpdir(), "hivo-source-evidence-invalid-"));
+  const unresolvedMarker = "IMPLEMENT_WITH_UNRESOLVED_PREREQUISITE";
+  const mismatchedMarker = "IMPLEMENT_WITH_UNDECLARED_PREREQUISITE";
+  let implementationCalls = 0;
+  const provider = recursiveProvider({
+    atomicity: [
+      { isAtomic: false, score: 6, rationale: "Root should split.", failures: ["multiple_goals"] },
+      { isAtomic: true, score: 2, rationale: "Inspection task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Unresolved task is atomic.", failures: [] },
+      { isAtomic: true, score: 2, rationale: "Mismatched task is atomic.", failures: [] }
+    ],
+    splitResults: [{
+      rationale: "Fixture for invalid evidence prerequisite references.",
+      subTasks: [
+        {
+          id: "inspect_source",
+          title: "Inspect source",
+          taskPrompt: "Inspect source.",
+          expectedOutput: "Source evidence",
+          dependencies: []
+        },
+        {
+          id: "unresolved_task",
+          title: "Unresolved source task",
+          taskPrompt: unresolvedMarker,
+          expectedOutput: "Implementation",
+          dependencies: ["0"],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "missing_subtask",
+            sourcePath: "src/source.js",
+            evidenceType: "verified_workspace_source"
+          }
+        },
+        {
+          id: "mismatched_task",
+          title: "Undeclared source task",
+          taskPrompt: mismatchedMarker,
+          expectedOutput: "Implementation",
+          dependencies: [],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "inspect_source",
+            sourcePath: "src/source.js",
+            evidenceType: "verified_workspace_source"
+          }
+        }
+      ]
+    }],
+    structuredNodeOutput: (request) => {
+      if (request.userPrompt.includes(unresolvedMarker) || request.userPrompt.includes(mismatchedMarker)) {
+        implementationCalls++;
+      }
+      return {
+        kind: "evidence_report",
+        findings: [],
+        files: [],
+        symbols: [],
+        evidence_refs: [],
+        unknowns: [],
+        confidence: 0.9
+      };
+    }
+  });
+  const orchestrator = new RecursiveSwarmOrchestrator({
+    provider,
+    workspacePath,
+    options: {
+      maxDepth: 3,
+      maxAgents: 10,
+      enableGoalKeeper: false,
+      enableParallelExecution: false,
+      enableErrorRecovery: false
+    }
+  });
+
+  try {
+    const result = await orchestrator.run("Implement tasks with verified source prerequisites.");
+    assert.equal(implementationCalls, 0);
+    for (const taskName of ["Unresolved source task", "Undeclared source task"]) {
+      const node = Object.values(result.runState.tree.nodes).find((candidate) => candidate.name.includes(taskName));
+      assert.ok(node);
+      assert.equal(node.status, "blocked");
+      assert.match(node.errorSummary ?? "", /prerequisite/i);
+    }
+  } finally {
+    rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test("splitter preserves a declared verified workspace source prerequisite", async () => {
+  const targetPath = "src/elements/element.bar.js";
+  const provider = recursiveProvider({
+    splitResults: [{
+      rationale: "Verify source before implementing.",
+      subTasks: [
+        {
+          id: "inspect_bar_source",
+          title: "Inspect bar source",
+          taskPrompt: `Read ${targetPath} and return verified workspace source evidence.`,
+          expectedOutput: "Verified source evidence",
+          dependencies: []
+        },
+        {
+          id: "implement_bar_fix",
+          title: "Implement bar fix",
+          taskPrompt: "Implement the fix using the prerequisite source evidence.",
+          expectedOutput: "Grounded code patch",
+          dependencies: ["0"],
+          sourceEvidenceRequirement: {
+            prerequisiteSubtaskId: "inspect_bar_source",
+            sourcePath: targetPath,
+            evidenceType: "verified_workspace_source"
+          }
+        }
+      ]
+    }]
+  });
+  const splitter = new RecursiveTaskSplitter({ provider });
+  const split = await splitter.splitTask(makeTestNode(), {
+    ...DEFAULT_RECURSIVE_SWARM_OPTIONS,
+    maxDepth: 3
+  });
+
+  assert.deepEqual(split.subTasks[1].sourceEvidenceRequirement, {
+    prerequisiteSubtaskId: "inspect_bar_source",
+    sourcePath: targetPath,
+    evidenceType: "verified_workspace_source"
+  });
+  assert.equal(split.subTasks[0].id, "inspect_bar_source");
+});
+
 test("deadlock detection blocks circular deps deterministically", async () => {
   const orchestrator = new RecursiveSwarmOrchestrator({
     provider: recursiveProvider({
@@ -538,3 +1004,109 @@ test("orchestrator without provider blocks recursive semantic planning", async (
   assert.match(rootNode.errorSummary ?? "", /requires a configured provider/);
   assert.equal(result.runState.tree.status, "failed");
 });
+
+test("contradictory high-atomicity child executes without recursive split", async () => {
+  const orchestrator = new RecursiveSwarmOrchestrator({
+    provider: recursiveProvider({
+      atomicity: [
+        // Root: score=3, real failures, recommendation=split
+        { isAtomic: false, score: 3, rationale: "Root task needs split.", failures: ["MULTIPLE_STEPS"], recommendation: "split" },
+        // Child 0: score=9, failures=[], isAtomic=false, recommendation=split (contradictory model labels)
+        { isAtomic: false, score: 9, rationale: "Run test suite satisfies all atomicity conditions.", failures: [], recommendation: "split" },
+        // Child 1 (Implementation): score=9, failures=[], isAtomic=false, recommendation=split
+        { isAtomic: false, score: 9, rationale: "Create minimal patch is atomic.", failures: [], recommendation: "split" }
+      ],
+      splitResults: [{
+        rationale: "Decompose into test execution and implementation fix.",
+        subTasks: [
+          {
+            id: "0",
+            title: "Run test suite",
+            taskPrompt: "Run test suite and capture failing test",
+            expectedOutput: "test_report.txt",
+            dependencies: [],
+            responsibility: "INSPECT"
+          },
+          {
+            id: "1",
+            title: "Create minimal patch",
+            taskPrompt: "Create minimal code patch to fix failing test",
+            expectedOutput: "code_patch.diff",
+            dependencies: ["0"],
+            responsibility: "IMPLEMENT",
+            canWrite: true
+          }
+        ]
+      }],
+      structuredNodeOutput: (request) => {
+        if (request.userPrompt.includes("Create minimal code patch")) {
+          return {
+            kind: "generated_artifact",
+            path: "code_patch.diff",
+            content: "--- a/calc.ts\n+++ b/calc.ts\n@@ -1 +1 @@\n-return a + b;\n+return a * b;\n",
+            artifact_type: "text",
+            description: "Multiply fix",
+            validation_steps: [],
+            completeness_notes: [],
+            confidence: 0.95
+          };
+        }
+        return {
+          kind: "generated_artifact",
+          path: "test_report.txt",
+          content: "FAIL: multiply test failed",
+          artifact_type: "text",
+          description: "Test run report",
+          validation_steps: [],
+          completeness_notes: [],
+          confidence: 0.95
+        };
+      }
+    }),
+    options: {
+      maxDepth: 3,
+      maxAgents: 10,
+      enableGoalKeeper: false,
+      enableParallelExecution: false,
+      enableErrorRecovery: false
+    }
+  });
+
+  const result = await orchestrator.run(
+    "Identify failing test and fix it"
+  );
+
+  const rootNode = result.runState.tree.nodes[result.runState.tree.rootId];
+  // 1. Root decomposes
+  assert.equal(rootNode.status, "succeeded");
+  assert.equal(rootNode.children.length, 4); // GoalKeeper + 2 task children + 1 collector
+
+  // 2. Contradictory high-atomicity child executes without another split
+  const taskChildren = Object.values(result.runState.tree.nodes).filter(
+    (n) => n.parentId === rootNode.id && n.kind === "task_agent"
+  );
+  assert.equal(taskChildren.length, 2);
+
+  const testChild = taskChildren.find((n) => n.name.includes("Run test suite"));
+  assert.ok(testChild, "Run test suite child exists");
+  assert.equal(testChild.status, "succeeded");
+  assert.equal(testChild.children.length, 0, "High-atomicity child did not split further");
+  assert.equal(testChild.complexity?.isAtomic, true, "isAtomic corrected to true");
+  assert.equal(testChild.complexity?.recommendation, "execute", "recommendation corrected to execute");
+
+  // 3. Assigned task responsibility is preserved
+  assert.equal(testChild.contract?.responsibility, "INSPECT");
+
+  // 4. Genuine implementation workers remain reachable
+  const implementChild = taskChildren.find((n) => n.name.includes("Create minimal patch"));
+  assert.ok(implementChild, "Implementation child exists");
+  assert.equal(implementChild.status, "succeeded");
+  assert.equal(implementChild.contract?.responsibility, "IMPLEMENT");
+  assert.equal(implementChild.children.length, 0, "Implementation child executed directly without splitting");
+
+  // 5. No fabricated patch success: real artifact generated
+  assert.equal(implementChild.structuredOutput?.kind, "generated_artifact");
+  assert.equal(result.totalSplits, 1, "Only Root split (1 split total, no repeated splits to depth 4)");
+  assert.equal(result.totalExecutions, 2, "Both children executed directly");
+});
+

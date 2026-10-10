@@ -24,8 +24,53 @@ export type ConversationUnderstanding = {
   turnUnderstanding?: TurnUnderstanding;
 };
 
+function isExplicitCodingAndPatchRequest(text: string): boolean {
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  const hasPatch = /\b(patch|diff|pull request|pr)\b/i.test(normalized) || /(?:باتش)/.test(normalized);
+  if (!hasPatch) return false;
+
+  const hasCodeModification = /\b(fix|modify|edit|change|repair|refactor|implement)\b/i.test(normalized)
+    || /(?:صلح|عدل|غير|نفذ)/.test(normalized);
+  const hasPatchAction = /\b(generate|create|produce|propose|provide|submit|make|apply|build)\b.{0,30}\b(?:reviewable\s+)?(?:patch|diff)\b/i.test(normalized)
+    || /\b(?:patch|diff)\b.{0,30}\b(generation|proposal|creation)\b/i.test(normalized);
+
+  if (!hasCodeModification && !hasPatchAction) return false;
+
+  const isReadOnlyQuestion = /\b(what|why|how|where|which|who|can you explain)\b.{0,40}\b(is|are|does|do|was|were)\b/i.test(normalized)
+    && !hasPatchAction;
+
+  return !isReadOnlyQuestion;
+}
+
 export function conversationUnderstandingFromTurnUnderstanding(value: TurnUnderstanding): ConversationUnderstanding {
+  const isOverriddenInspection = (value.route === "inspect_explain" || value.intentKind === "workspace_question")
+    && isExplicitCodingAndPatchRequest(value.originalRequest);
+
+  const intentKind = isOverriddenInspection ? "workspace_action" : value.intentKind;
+  const route = isOverriddenInspection ? "simple_run" : value.route;
+  const rationale = isOverriddenInspection
+    ? "Original user request explicitly asks to modify code and generate a patch; overriding provider inspect route."
+    : value.rationale;
   const workspaceMessage = value.needsWorkspace ? value.cleanedRequest : "";
+
+  const intentDecision: IntentDecision = {
+    kind: intentKind,
+    language: value.language,
+    needsWorkspace: value.needsWorkspace,
+    confidence: value.confidence,
+    rationale
+  };
+
+  const routeDecision: ConversationRouteDecision = {
+    route,
+    confidence: value.confidence,
+    language: value.language,
+    normalizedPrompt: value.originalRequest,
+    workspacePrompt: workspaceMessage || value.originalRequest,
+    rationale
+  };
+
   return {
     originalMessage: value.originalRequest,
     preparedPrompt: {
@@ -34,22 +79,12 @@ export function conversationUnderstandingFromTurnUnderstanding(value: TurnUnders
       droppedPreamble: value.cleanedRequest !== value.originalRequest ? value.originalRequest : ""
     },
     workspaceMessage,
-    intentDecision: {
-      kind: value.intentKind,
-      language: value.language,
-      needsWorkspace: value.needsWorkspace,
-      confidence: value.confidence,
-      rationale: value.rationale
-    },
-    routeDecision: {
-      route: value.route,
-      confidence: value.confidence,
-      language: value.language,
-      normalizedPrompt: value.originalRequest,
-      workspacePrompt: workspaceMessage || value.originalRequest,
-      rationale: value.rationale
-    },
-    turnUnderstanding: value
+    intentDecision,
+    routeDecision,
+    workspaceIntent: intentDecision.kind === "direct_conversation"
+      ? undefined
+      : alignWorkspaceIntentWithDecision(inferWorkspaceIntent(workspaceMessage || value.originalRequest), intentDecision),
+    turnUnderstanding: isOverriddenInspection ? { ...value, route, intentKind } : value
   };
 }
 

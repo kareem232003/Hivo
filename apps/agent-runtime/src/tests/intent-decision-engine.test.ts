@@ -3,11 +3,14 @@ import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { SanitizedProviderConfig } from "@hivo/protocol";
+import type { SanitizedProviderConfig, TurnUnderstanding } from "@hivo/protocol";
 import type { LlmProvider, LlmRequest } from "../llm/LlmProvider.js";
 import { loadConfig } from "../config.js";
 import { AgentRuntime } from "../runtime/AgentRuntime.js";
-import { createConversationUnderstanding } from "../runtime/ConversationUnderstanding.js";
+import {
+  conversationUnderstandingFromTurnUnderstanding,
+  createConversationUnderstanding
+} from "../runtime/ConversationUnderstanding.js";
 import { routeConversation } from "../runtime/ConversationRouter.js";
 import { EventBus } from "../runtime/EventBus.js";
 import { classifyAgenticTaskIntent } from "../runtime/AgenticIntentClassifier.js";
@@ -267,3 +270,51 @@ function getSchemaName(schema: unknown) {
     ? String((schema as { name: string }).name)
     : "unknown";
 }
+
+test("Axios regression: explicit bugfix and patch request takes precedence over misleading inspect_explain router rewrite", () => {
+  const axiosFixPrompt = [
+    "Fix the following issue in this Axios repository.",
+    "",
+    "**Unexpected default maxBodyLength enforcement by follow-redirects**",
+    "",
+    "After an upgrade of follow-redirects, Axios began enforcing a default 10 MB request-body limit, even though its default behavior was intended to be unlimited.",
+    "",
+    "Investigate and fix the issue while preserving existing behavior and explicit body-size limits.",
+    "",
+    "Generate a reviewable patch, request approval before applying changes, and verify the result."
+  ].join("\n");
+
+  const misleadingRouterTurn: TurnUnderstanding = {
+    originalRequest: axiosFixPrompt,
+    cleanedRequest: "Locate and modify the Axios code that sets the default maxBodyLength (currently 10 MB after follow-redirects upgrade) so that the default is unlimited and behaves consistently regardless of maxRedirects. Produce a reviewable patch, ask for approval, then run the repository's Docker-based tests to confirm the fix.",
+    language: "english",
+    intentKind: "workspace_question",
+    route: "inspect_explain",
+    needsWorkspace: true,
+    goal: "Identify the source handling of maxBodyLength default in the Axios codebase, adjust it to make the default unlimited, create a patch, seek approval, and verify that all tests pass.",
+    ambiguities: [],
+    requiredEvidence: ["Source file(s) where maxBodyLength default is defined"],
+    risk: "medium",
+    confidence: "high",
+    rationale: "The user asks for a code change; the first step must be to investigate the existing implementation to understand where and how the default maxBodyLength is set before proposing a fix."
+  };
+
+  const understanding = conversationUnderstandingFromTurnUnderstanding(misleadingRouterTurn);
+
+  // Original user intent explicitly asks to fix a bug and generate a patch.
+  // The original user intent must take precedence over misleading router rewrites:
+  // Expected: An implementation-capable route (recursive_factory, orchestrated_run, or simple_run), NOT inspect_explain.
+  assert.notEqual(understanding.routeDecision.route, "inspect_explain");
+  assert.equal(understanding.intentDecision.kind, "workspace_action");
+  assert.notEqual(classifyRunIntent(axiosFixPrompt, understanding), "inspect_only");
+});
+
+test("Axios regression: genuine read-only code location questions still reach inspect_explain", () => {
+  const genuineInspectPrompt = "Where is maxBodyLength handled in this Axios codebase? Explain the current behavior.";
+  const understanding = createConversationUnderstanding(genuineInspectPrompt);
+
+  assert.equal(understanding.routeDecision.route, "inspect_explain");
+  assert.equal(understanding.intentDecision.kind, "workspace_question");
+  assert.equal(classifyRunIntent(genuineInspectPrompt, understanding), "inspect_only");
+});
+

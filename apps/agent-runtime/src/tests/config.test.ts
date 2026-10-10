@@ -20,6 +20,26 @@ test("loadConfig exposes real provider request timeout instead of fixed provider
   }
 });
 
+test("loadConfig exposes shared per-run provider call and wall-clock limits", () => {
+  const previousCalls = process.env.HIVO_RUN_MAX_PROVIDER_CALLS;
+  const previousWallClock = process.env.HIVO_RUN_MAX_WALL_CLOCK_MS;
+  try {
+    process.env.HIVO_RUN_MAX_PROVIDER_CALLS = "7";
+    process.env.HIVO_RUN_MAX_WALL_CLOCK_MS = "90000";
+
+    assert.equal(loadConfig().maxProviderCallsPerRun, 7);
+    assert.equal(loadConfig().maxRunWallClockMs, 90_000);
+
+    delete process.env.HIVO_RUN_MAX_PROVIDER_CALLS;
+    delete process.env.HIVO_RUN_MAX_WALL_CLOCK_MS;
+    assert.equal(loadConfig().maxProviderCallsPerRun, 24);
+    assert.equal(loadConfig().maxRunWallClockMs, 1_200_000);
+  } finally {
+    restoreEnv("HIVO_RUN_MAX_PROVIDER_CALLS", previousCalls);
+    restoreEnv("HIVO_RUN_MAX_WALL_CLOCK_MS", previousWallClock);
+  }
+});
+
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) {
     delete process.env[name];

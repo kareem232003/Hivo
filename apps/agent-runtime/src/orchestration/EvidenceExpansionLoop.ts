@@ -50,7 +50,7 @@ export function expandEditIntent(input: ExpansionInput): EvidenceExpansionResult
   let refinedAnchorLine = existingOverrides?.anchorLine;
   let refinedInsertAfter = existingOverrides?.insertAfterAnchor;
   let refinedInsertBefore = existingOverrides?.insertBeforeAnchor;
-  let refinedEvidenceRefs = [...editIntent.evidence_refs];
+  let refinedEvidenceRefs = [...(editIntent.evidence_refs ?? [])];
 
   // 1. Try to fill target_file from evidence pack
   if (!refinedTargetFile || refinedTargetFile.trim() === "") {

@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { LlmProvider } from "../llm/LlmProvider.js";
-import { invokeReasoningProviderStructured, invokeReasoningProviderText } from "../runtime/ReasoningKernel.js";
+import { invokeReasoningProviderStructured } from "../runtime/ReasoningKernel.js";
+import { WorkspaceTools } from "../tools/WorkspaceTools.js";
+import { isSecretCandidate, resolveInsideWorkspace } from "../tools/security.js";
 import { GoalKeeperAgent } from "./GoalKeeperAgent.js";
 import { HierarchicalCollector } from "./HierarchicalCollector.js";
 import { RecursiveTaskSplitter } from "./RecursiveTaskSplitter.js";
@@ -27,7 +29,9 @@ import type {
   RecursiveRunCheckpoint,
   DurableActivityRow,
   SplitResult,
-  SplitSubTask
+  SplitSubTask,
+  WorkerExecutionContract,
+  WorkerResponsibility
 } from "./RecursiveSwarmModels.js";
 import {
   RECURSIVE_SWARM_SCHEMA_VERSION,
@@ -36,10 +40,20 @@ import {
   normalizeRecursiveNodeOutput,
   wrapTextFallback,
   RECURSIVE_OUTPUT_KINDS,
+  isStructuredNodeOutputValid,
   EDIT_INTENT_OPERATIONS,
   RISK_LEVELS,
-  REVIEW_DECISIONS
+  REVIEW_DECISIONS,
+  isImplementationGoal,
+  createWorkerExecutionContract,
+  extractLocalTaskObjective,
+  classifyWorkerResponsibility
 } from "./RecursiveSwarmModels.js";
+import {
+  isActionableImplementationOutput,
+  isPatchReadyImplementationOutput,
+  assessImplementationPatchReadiness
+} from "./RecursiveEditIntentBridge.js";
 import type {
   AgentRuntimeSwarmNode,
   AgentRuntimeSwarmNodeKind,
@@ -69,6 +83,58 @@ export type RecursiveSwarmResult = {
   contextSourceCounts: Record<RecursiveContextSource, number>;
 };
 
+function isPlaceholderPath(rawPath: string): boolean {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return true;
+  if (/^<.*>$/.test(trimmed)) return true;
+  if (/\b(?:to be filled|placeholder|runtime will fill|sourceLocation\.txt)\b/i.test(trimmed)) return true;
+  return false;
+}
+
+function extractCandidatePathsFromPrerequisite(
+  prerequisite: RecursiveSwarmNode,
+  workspaceRoot: string
+): string[] {
+  const candidates: string[] = [];
+  const textCorpus: string[] = [];
+
+  if (prerequisite.structuredOutput) {
+    const out = prerequisite.structuredOutput;
+    if (out.kind === "generated_artifact") {
+      textCorpus.push(out.content);
+    } else if (out.kind === "evidence_report") {
+      for (const f of out.files) {
+        textCorpus.push(f);
+      }
+      textCorpus.push(...out.findings);
+    } else if (out.kind === "edit_intent") {
+      textCorpus.push(out.target_file);
+    }
+  }
+  if (prerequisite.outputSummary) {
+    textCorpus.push(prerequisite.outputSummary);
+  }
+
+  const combined = textCorpus.join("\n");
+  const fileMatches = combined.match(/[A-Za-z0-9_\-./\\]+\.[a-zA-Z0-9]+/g) ?? [];
+  for (const match of fileMatches) {
+    const cleaned = match.replace(/^[<"']+|[>"',;:)]+$/g, "").replace(/\\/g, "/");
+    if (!cleaned || isPlaceholderPath(cleaned) || path.isAbsolute(cleaned)) continue;
+    try {
+      const lexical = resolveInsideWorkspace(workspaceRoot, cleaned);
+      if (existsSync(lexical) && statSync(lexical).isFile()) {
+        if (!candidates.includes(cleaned)) {
+          candidates.push(cleaned);
+        }
+      }
+    } catch {
+      // Ignore invalid candidates
+    }
+  }
+
+  return candidates;
+}
+
 export class RecursiveSwarmOrchestrator {
   private readonly provider?: LlmProvider;
   private readonly workspacePath: string;
@@ -91,6 +157,9 @@ export class RecursiveSwarmOrchestrator {
   private sessionId: string = "";
   private expandedGoalSpec?: ExpandedGoalSpec;
   private budget?: RecursiveRunBudget;
+  private semanticRecoveryAttemptsByNode = new Set<string>();
+  private totalSemanticRecoveryAttempts = 0;
+  private readonly maxRunSemanticRecoveries: number = 3;
   private contextSourceCounts: Record<RecursiveContextSource, number> = {
     memory_evidence: 0,
     partial_context: 0,
@@ -133,13 +202,34 @@ export class RecursiveSwarmOrchestrator {
       workspaceIdentity: this.workspacePath,
       localTask: goal
     });
+    const rootRequiresImpl = isImplementationGoal(goal);
+    const rootContract = createWorkerExecutionContract({
+      nodeId: "pending",
+      localObjective: goal,
+      originalGoal: goal,
+      title: "Root",
+      isRootGoalImplementation: rootRequiresImpl,
+      explicitResponsibility: rootRequiresImpl ? "IMPLEMENT" : "INSPECT"
+    });
     const rootNode = this.createNode({
       name: "Root",
       kind: "root",
       taskPrompt: goal,
       goalEnvelope,
       parentId: undefined,
-      depth: 0
+      depth: 0,
+      contract: rootContract
+    });
+    rootContract.nodeId = rootNode.id;
+
+    const goalKeeperContract = createWorkerExecutionContract({
+      nodeId: "pending",
+      parentId: rootNode.id,
+      localObjective: `Monitor alignment with original goal: ${goal}`,
+      originalGoal: goal,
+      title: "Goal Keeper",
+      parentContract: rootContract,
+      explicitResponsibility: "VERIFY"
     });
     const goalKeeperNode = this.createNode({
       name: `Goal Keeper`,
@@ -147,8 +237,10 @@ export class RecursiveSwarmOrchestrator {
       taskPrompt: `Monitor alignment with original goal: ${goal}`,
       goalEnvelope,
       parentId: rootNode.id,
-      depth: 0
+      depth: 0,
+      contract: goalKeeperContract
     });
+    goalKeeperContract.nodeId = goalKeeperNode.id;
     rootNode.children.push(goalKeeperNode.id);
     this.tree = {
       schema_version: RECURSIVE_SWARM_SCHEMA_VERSION,
@@ -200,6 +292,7 @@ export class RecursiveSwarmOrchestrator {
     }
     const rootNode = this.tree.nodes[this.tree.rootId];
     await this.processNode(rootNode);
+
     // Build context-source summary
     const totalNodes = Object.values(this.tree.nodes).length;
     const evidenceCount = this.contextSourceCounts.memory_evidence;
@@ -576,7 +669,9 @@ Return structured JSON only. Never replace an artifact request with a small plan
       return;
     }
 
-    if (assessment.recommendation === "split") {
+    const hasZeroFailures = (assessment.failures ?? []).length === 0;
+    const isContradictorySplit = assessment.recommendation === "split" && hasZeroFailures && assessment.score >= 7;
+    if (assessment.recommendation === "split" && !isContradictorySplit) {
       await this.splitAndProcess(node);
     } else {
       await this.enqueueNodeExecution(node);
@@ -660,7 +755,40 @@ Return structured JSON only. Never replace an artifact request with a small plan
     if (pack.freshness_status === "stale") {
       lines.push("WARNING: Memory evidence may be stale. Verify file contents before relying on file paths or summaries.");
     }
-    return lines.join("\n");
+
+    const snippets = pack.source_snippets ?? pack.snippets ?? [];
+    if (snippets.length) {
+      lines.push("");
+      lines.push("=== Source Evidence ===");
+      for (const snippet of snippets) {
+        lines.push(`File: ${snippet.path}`);
+        lines.push(`Lines: ${snippet.start_line}-${snippet.end_line}`);
+        lines.push(snippet.content);
+        if (snippet.truncated) {
+          lines.push("[... truncated ...]");
+        }
+        lines.push("");
+      }
+    }
+
+    const baselineCommand = pack.baseline_command ?? pack.baseline_command_result;
+    if (baselineCommand) {
+      lines.push("=== Baseline Command Evidence ===");
+      lines.push(`Command: ${baselineCommand.command}`);
+      if (typeof baselineCommand.exitCode === "number") {
+        lines.push(`Exit code: ${baselineCommand.exitCode}`);
+      }
+      if (baselineCommand.stdout) {
+        lines.push("STDOUT:");
+        lines.push(baselineCommand.stdout);
+      }
+      if (baselineCommand.stderr) {
+        lines.push("STDERR:");
+        lines.push(baselineCommand.stderr);
+      }
+    }
+
+    return lines.join("\n").trimEnd();
   }
 
   private async providerAssessAtomic(node: RecursiveSwarmNode): Promise<AtomicTaskAssessment> {
@@ -716,10 +844,11 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
         }
       );
       const score = Math.max(1, Math.min(10, Math.round(response.score ?? 5))) as AtomicTaskAssessment["score"];
-      const isAtomic = response.isAtomic === true && score < 5 && response.failures.length === 0;
-      let recommendation: AtomicTaskAssessment["recommendation"] = "execute";
-      if (!isAtomic) recommendation = "split";
-      if (score >= 8 && node.depth >= 5) recommendation = "escalate";
+      const hasZeroFailures = (response.failures ?? []).length === 0;
+      const isHighAtomicity = hasZeroFailures && score >= 7;
+      const isAtomic = isHighAtomicity || (response.isAtomic === true && score < 5 && hasZeroFailures);
+      let recommendation: AtomicTaskAssessment["recommendation"] = isAtomic ? "execute" : "split";
+      if (!isAtomic && score >= 8 && node.depth >= 5) recommendation = "escalate";
       return { isAtomic, score, rationale: response.rationale ?? "Provider assessment", failures: response.failures ?? [], recommendation };
     } catch (error) {
       return {
@@ -773,17 +902,51 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
     });
     this.emitNodeStatusChanged(node);
 
+    const rootRequiresImplementation = isImplementationGoal(node.goalEnvelope.originalGoal);
+    if (rootRequiresImplementation && splitResult.subTasks.length > 0 && (node.kind === "root" || node.contract?.responsibility === "IMPLEMENT")) {
+      const hasImplementTask = splitResult.subTasks.some((st) => st.responsibility === "IMPLEMENT");
+      if (!hasImplementTask) {
+        let targetIdx = splitResult.subTasks.findIndex((st) =>
+          /\b(fix|edit|modify|patch|repair|write|code|change|implement)\b/i.test(`${st.title} ${st.expectedOutput}`)
+        );
+        if (targetIdx === -1) {
+          const nonVerifyIdx = splitResult.subTasks.map((st, i) => ({ st, i })).reverse().find(({ st }) => st.responsibility !== "VERIFY")?.i;
+          targetIdx = nonVerifyIdx ?? splitResult.subTasks.length - 1;
+        }
+        if (targetIdx >= 0 && targetIdx < splitResult.subTasks.length) {
+          splitResult.subTasks[targetIdx].responsibility = "IMPLEMENT";
+          splitResult.subTasks[targetIdx].canWrite = true;
+        }
+      }
+    }
+
     const childNodes: RecursiveSwarmNode[] = [];
 
     for (const subTask of splitResult.subTasks) {
+      const parentContract = node.contract;
+      const childContract = createWorkerExecutionContract({
+        nodeId: "pending",
+        parentId: node.id,
+        localObjective: extractLocalTaskObjective(subTask.taskPrompt, subTask.title),
+        originalGoal: node.goalEnvelope.originalGoal,
+        title: subTask.title,
+        expectedOutput: subTask.expectedOutput,
+        canWrite: subTask.canWrite,
+        parentContract,
+        isRootGoalImplementation: rootRequiresImplementation,
+        explicitResponsibility: subTask.responsibility
+      });
+
       const childNode = this.createNode({
         name: subTask.title.slice(0, 40),
         kind: "task_agent",
         taskPrompt: subTask.taskPrompt,
         goalEnvelope: { ...node.goalEnvelope, localTask: subTask.taskPrompt },
         parentId: node.id,
-        depth: node.depth + 1
+        depth: node.depth + 1,
+        contract: childContract
       });
+      childContract.nodeId = childNode.id;
       childNodes.push(childNode);
       node.children.push(childNode.id);
       this.tree.nodes[childNode.id] = childNode;
@@ -792,14 +955,25 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
       this.emitNodeCreated(childNode);
     }
     // Create visible collector for this parent
+    const collectorContract = createWorkerExecutionContract({
+      nodeId: "pending",
+      parentId: node.id,
+      localObjective: `Merge results from ${childNodes.length} child agent(s)`,
+      originalGoal: node.goalEnvelope.originalGoal,
+      title: `Collector (${node.name})`,
+      explicitResponsibility: "INTEGRATE",
+      parentContract: node.contract
+    });
     const collectorNode = this.createNode({
       name: `Collector (${node.name})`,
       kind: "collector",
       taskPrompt: `Merge results from ${childNodes.length} child agent(s) for: ${node.goalEnvelope.localTask}`,
       goalEnvelope: node.goalEnvelope,
       parentId: node.id,
-      depth: node.depth
+      depth: node.depth,
+      contract: collectorContract
     });
+    collectorContract.nodeId = collectorNode.id;
     node.children.push(collectorNode.id);
     this.tree.nodes[collectorNode.id] = collectorNode;
     this.tree.totalNodes++;
@@ -851,11 +1025,13 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
     const indexToChildId: string[] = parentSplitResult.subTasks.map((st, i) => children[i]?.id ?? "");
     const subtaskIdToChildId = new Map<string, string>();
     const childIdToResolvedDeps = new Map<string, string[]>();
+    const childIdToSubTask = new Map<string, SplitSubTask>();
     for (let i = 0; i < parentSplitResult.subTasks.length; i++) {
       const st = parentSplitResult.subTasks[i];
       const childId = children[i]?.id;
       if (!childId) continue;
       subtaskIdToChildId.set(st.id, childId);
+      childIdToSubTask.set(childId, st);
     }
     // Resolve each child's dependencies to child node IDs
     for (let i = 0; i < parentSplitResult.subTasks.length; i++) {
@@ -863,14 +1039,18 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
       const childId = children[i]?.id;
       if (!childId) continue;
       const resolved = st.dependencies.map((dep) => {
+        // Try as subtask ID first (e.g. "1", "task_inspect", etc.)
+        const mapped = subtaskIdToChildId.get(dep);
+        if (mapped && mapped !== childId) return mapped;
         // Try as numeric index
         if (/^\d+$/.test(dep)) {
           const idx = parseInt(dep, 10);
+          // Try 0-based index
           if (idx >= 0 && idx < indexToChildId.length && idx !== i) return indexToChildId[idx];
+          // Try 1-based index (e.g., dep "1" referencing index 0)
+          const idx1 = idx - 1;
+          if (idx1 >= 0 && idx1 < indexToChildId.length && idx1 !== i) return indexToChildId[idx1];
         }
-        // Try as subtask ID
-        const mapped = subtaskIdToChildId.get(dep);
-        if (mapped && mapped !== childId) return mapped;
         return "";
       }).filter(Boolean) as string[];
       childIdToResolvedDeps.set(childId, resolved);
@@ -897,21 +1077,165 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
         break;
       }
       // Execute ready batch respecting parallel cap
+      const executeReadyChild = async (id: string) => {
+        const node = this.tree.nodes[id];
+        const subTask = childIdToSubTask.get(id);
+        if (!node || !subTask) return;
+        const readiness = this.prepareRequiredSourceEvidence(subTask, node, parentSplitResult, subtaskIdToChildId, childIdToResolvedDeps);
+        if (!readiness.ready) {
+          node.status = "blocked";
+          node.errorSummary = readiness.reason;
+          this.emitNodeStatusChanged(node);
+          return;
+        }
+
+        // Pass upstream dependency deliverables to child context
+        const depContexts: string[] = [];
+        const resolvedDeps = childIdToResolvedDeps.get(id) ?? [];
+        for (const depId of resolvedDeps) {
+          const depNode = this.tree.nodes[depId];
+          if (!depNode || depNode.status !== "succeeded") continue;
+          if (depNode.structuredOutput?.kind === "generated_artifact") {
+            const art = depNode.structuredOutput;
+            const bounded = art.content.length <= 4000 ? art.content : `${art.content.slice(0, 4000)}\n...[truncated]`;
+            depContexts.push(`=== Dependency Deliverable: ${art.path} (from ${depNode.name}) ===\n${bounded}`);
+          }
+        }
+        if (depContexts.length > 0) {
+          node.taskPrompt = `${node.taskPrompt}\n\n${depContexts.join("\n\n")}`;
+        }
+
+        if (readiness.context) {
+          node.taskPrompt = `${node.taskPrompt}\n\n${readiness.context}`;
+        }
+        await this.processNode(node);
+      };
       if (this.runOptions.enableParallelExecution) {
         const maxParallel = this.runOptions.maxWriteExecutors;
         for (let i = 0; i < ready.length; i += maxParallel) {
           const slice = ready.slice(i, i + maxParallel);
-          await Promise.all(slice.map((id) => this.processNode(this.tree.nodes[id])));
+          await Promise.all(slice.map(executeReadyChild));
         }
       } else {
         for (const id of ready) {
-          await this.processNode(this.tree.nodes[id]);
+          await executeReadyChild(id);
         }
       }
       for (const id of ready) {
         executed.add(id);
       }
       remaining = remaining.filter((id) => !executed.has(id));
+    }
+  }
+
+  private prepareRequiredSourceEvidence(
+    subTask: SplitSubTask,
+    node: RecursiveSwarmNode,
+    splitResult: SplitResult,
+    subtaskIdToChildId: Map<string, string>,
+    childIdToResolvedDeps: Map<string, string[]>
+  ): { ready: true; context?: string } | { ready: false; reason: string } {
+    const requirement = subTask.sourceEvidenceRequirement;
+    if (!requirement) return { ready: true };
+
+    const prerequisiteMatches = splitResult.subTasks.filter((candidate) => candidate.id === requirement.prerequisiteSubtaskId);
+    const prerequisiteIndex = /^\d+$/.test(requirement.prerequisiteSubtaskId)
+      ? Number(requirement.prerequisiteSubtaskId)
+      : -1;
+    const prerequisiteSubTask = prerequisiteMatches.length === 1
+      ? prerequisiteMatches[0]
+      : prerequisiteMatches.length === 0 && Number.isSafeInteger(prerequisiteIndex)
+        ? splitResult.subTasks[prerequisiteIndex]
+        : undefined;
+    if (!prerequisiteSubTask) {
+      return { ready: false, reason: `Blocked: source evidence prerequisite "${requirement.prerequisiteSubtaskId}" is unresolved or ambiguous.` };
+    }
+    const prerequisiteChildId = subtaskIdToChildId.get(prerequisiteSubTask.id);
+    const prerequisiteDeclared = subTask.dependencies.some((dependency) => {
+      if (dependency === prerequisiteSubTask.id) return true;
+      if (/^\d+$/.test(dependency)) {
+        const idx = Number(dependency);
+        if (splitResult.subTasks[idx]?.id === prerequisiteSubTask.id) return true;
+        if (splitResult.subTasks[idx - 1]?.id === prerequisiteSubTask.id) return true;
+      }
+      return false;
+    });
+    if (!prerequisiteChildId || !prerequisiteDeclared || !(childIdToResolvedDeps.get(node.id) ?? []).includes(prerequisiteChildId)) {
+      return { ready: false, reason: `Blocked: source evidence prerequisite "${requirement.prerequisiteSubtaskId}" is not a declared dependency.` };
+    }
+    const prerequisite = this.tree.nodes[prerequisiteChildId];
+    if (!prerequisite || prerequisite.status !== "succeeded") {
+      return { ready: false, reason: `Blocked: prerequisite "${requirement.prerequisiteSubtaskId}" did not complete successfully; verified source evidence is unavailable.` };
+    }
+    if (!this.workspacePath) {
+      return { ready: false, reason: `Blocked: verified workspace source "${requirement.sourcePath}" cannot be read because workspace path is not set.` };
+    }
+
+    const workspaceRoot = realpathSync(this.workspacePath);
+    let effectiveSourcePath = requirement.sourcePath.trim();
+    const isPlaceholder = isPlaceholderPath(effectiveSourcePath);
+
+    let directExists = false;
+    if (!isPlaceholder && !path.isAbsolute(effectiveSourcePath)) {
+      try {
+        const lexical = resolveInsideWorkspace(workspaceRoot, effectiveSourcePath);
+        directExists = existsSync(lexical) && statSync(lexical).isFile();
+      } catch {
+        directExists = false;
+      }
+    }
+
+    if (!directExists) {
+      const candidates = extractCandidatePathsFromPrerequisite(prerequisite, workspaceRoot);
+      if (candidates.length > 0) {
+        effectiveSourcePath = candidates[0]!;
+      } else if (isPlaceholder) {
+        return {
+          ready: false,
+          reason: `Blocked: source path placeholder "${requirement.sourcePath}" could not be resolved to a verified workspace file from prerequisite "${prerequisiteSubTask.id}".`
+        };
+      }
+    }
+
+    if (isPlaceholderPath(effectiveSourcePath) || path.isAbsolute(effectiveSourcePath)) {
+      return {
+        ready: false,
+        reason: `Blocked: verified workspace source "${requirement.sourcePath}" cannot be read from the active workspace.`
+      };
+    }
+
+    try {
+      const lexicalPath = resolveInsideWorkspace(workspaceRoot, effectiveSourcePath);
+      const realPath = realpathSync(lexicalPath);
+      const relativeRealPath = path.relative(workspaceRoot, realPath);
+      if (relativeRealPath.startsWith("..") || path.isAbsolute(relativeRealPath) || isSecretCandidate(realPath)) {
+        throw new Error("Source path resolves outside the workspace or to a protected file.");
+      }
+      const content = new WorkspaceTools(workspaceRoot).readFile(effectiveSourcePath);
+      if (!content.trim()) throw new Error("Source file is empty.");
+      const lines = content.split(/\r?\n/);
+      const selectedLines = lines.slice(0, 100);
+      let excerpt = selectedLines.join("\n");
+      if (excerpt.length > 12_000) excerpt = excerpt.slice(0, 12_000);
+      const endLine = Math.min(selectedLines.length, excerpt.split("\n").length);
+      const digest = createHash("sha256").update(excerpt).digest("hex");
+      requirement.sourcePath = effectiveSourcePath.replaceAll("\\", "/");
+      return {
+        ready: true,
+        context: [
+          "=== Independently Verified Workspace Source ===",
+          `Prerequisite subtask: ${requirement.prerequisiteSubtaskId} (completed successfully)`,
+          `Source: ${requirement.sourcePath} (workspace-relative, lines 1-${endLine})`,
+          `Verification: read from the current workspace with path containment checks; SHA-256 of this bounded excerpt: ${digest}`,
+          "Source excerpt:",
+          excerpt
+        ].join("\n")
+      };
+    } catch (error) {
+      return {
+        ready: false,
+        reason: `Blocked: verified workspace source "${effectiveSourcePath}" is unavailable or unverifiable (${error instanceof Error ? error.message : String(error)}).`
+      };
     }
   }
 
@@ -939,85 +1263,223 @@ Return { isAtomic, score, rationale, failures } where failures lists which atomi
 - "integration_summary": child_outputs_used, conflicts[], merged_findings[], unresolved_items[]
 - "final_summary": summary, blockers[], edit_intents[], validation_plans[], confidence
 
-If the task asks to create a complete self-contained file, game, demo, page, or other final deliverable, prefer "generated_artifact" and put the complete file contents in "content". Do not summarize the deliverable instead of generating it.
+For tasks modifying, fixing, editing, or updating existing workspace code, return "edit_intent" (target_file, target_symbol_or_range, operation="modify", reason, expected_behavior) or a patch "generated_artifact" containing a valid unified diff targeting the source file. Do not generate auxiliary diagnostic, explanation, or report files (such as root_cause.md, modification_applied.txt, or test_output.txt) to describe code modifications unless explicitly requested by the task.
+If the task asks to create a complete self-contained new file, game, demo, page, or other final deliverable, use "generated_artifact" and put the complete file contents in "content". Do not summarize the deliverable instead of generating it.
 The original user goal is authoritative. If the deliverable contract requires code, source, or an artifact, produce that artifact or return a blocked/review decision with explicit evidence. A short plan or summary is not a valid substitute for the requested deliverable.
+
+CRITICAL PROTOCOL RULES:
+- Single Object: Return exactly ONE top-level JSON object. Do not return an array of objects or multiple top-level JSON documents.
+- No Direct Git Commands: You do not have workspace shell or Git authority. Never attempt, instruct, or pretend to run git apply or git commit. Propose code changes as a structured output for the runtime approval pipeline.
+- Concrete Implementations: If your responsibility is IMPLEMENT, return a concrete unified diff or replacement text, not metadata-only intents.
 Return valid JSON with a "kind" field matching one of the above.`;
 
     if (this.provider) {
+      const executorSystemPrompt = `You are an executor agent.\nOriginal goal (full, authoritative): ${node.goalEnvelope.originalGoal}\nExpanded goal/spec: ${node.goalEnvelope.expandedGoal ?? node.goalEnvelope.originalGoal}\nDeliverable contract: ${node.goalEnvelope.expandedGoalSpec?.deliverableContract ?? "Not specified"}\nTheme: ${node.goalEnvelope.theme}\nConstraints: ${node.goalEnvelope.constraints.join(", ")}\nAcceptance criteria: ${node.goalEnvelope.acceptanceCriteria.join(" | ")}\nComplete the following task without replacing the required artifact with a summary.${contextBlock ? `\n\n${contextBlock}` : ""}${contextNote}\n\n${structuredPrompt}`;
+
+      const structuredSchema = {
+        name: "structured_node_output",
+        type: "object",
+        additionalProperties: true,
+        required: ["kind"],
+        properties: {
+          kind: { type: "string", enum: RECURSIVE_OUTPUT_KINDS },
+          findings: { type: "array", items: { type: "string" } },
+          files: { type: "array", items: { type: "string" } },
+          symbols: { type: "array", items: { type: "string" } },
+          evidence_refs: { type: "array", items: { type: "string" } },
+          unknowns: { type: "array", items: { type: "string" } },
+          confidence: { type: "number" },
+          summary: { type: "string" },
+          blockers: { type: "array", items: { type: "string" } },
+          edit_intents: { type: "array", items: { type: "object" } },
+          validation_plans: { type: "array", items: { type: "object" } },
+          tasks: { type: "array", items: { type: "object" } },
+          validation_strategy: { type: "string" },
+          path: { type: "string" },
+          content: { type: "string" },
+          artifact_type: { type: "string" },
+          description: { type: "string" },
+          validation_steps: { type: "array", items: { type: "string" } },
+          completeness_notes: { type: "array", items: { type: "string" } },
+          target_file: { type: "string" },
+          target_symbol_or_range: { type: "string" },
+          operation: { type: "string" },
+          reason: { type: "string" },
+          expected_behavior: { type: "string" },
+          risk: { type: "string" },
+          commands: { type: "array", items: { type: "string" } },
+          smoke_checks: { type: "array", items: { type: "string" } },
+          expected_results: { type: "array", items: { type: "string" } },
+          decision: { type: "string" },
+          required_changes: { type: "array", items: { type: "string" } },
+          risks: { type: "array", items: { type: "string" } },
+          child_outputs_used: { type: "number" },
+          conflicts: { type: "array", items: { type: "string" } },
+          merged_findings: { type: "array", items: { type: "string" } },
+          unresolved_items: { type: "array", items: { type: "string" } }
+        }
+      };
+
+      let structuredSuccess = false;
+      let rawFirstOutput: unknown;
+
       try {
-        // Attempt structured output via invokeReasoningProviderStructured
         const raw = await invokeReasoningProviderStructured<Record<string, unknown>>(
           this.provider,
           {
-            systemPrompt: `You are an executor agent.\nOriginal goal (full, authoritative): ${node.goalEnvelope.originalGoal}\nExpanded goal/spec: ${node.goalEnvelope.expandedGoal ?? node.goalEnvelope.originalGoal}\nDeliverable contract: ${node.goalEnvelope.expandedGoalSpec?.deliverableContract ?? "Not specified"}\nTheme: ${node.goalEnvelope.theme}\nConstraints: ${node.goalEnvelope.constraints.join(", ")}\nAcceptance criteria: ${node.goalEnvelope.acceptanceCriteria.join(" | ")}\nComplete the following task without replacing the required artifact with a summary.${contextBlock ? `\n\n${contextBlock}` : ""}${contextNote}\n\n${structuredPrompt}`,
+            systemPrompt: executorSystemPrompt,
             userPrompt: node.taskPrompt,
             maxOutputTokens: 16384
           },
-          {
-            name: "structured_node_output",
-            type: "object",
-            additionalProperties: true,
-            required: ["kind"],
-            properties: {
-              kind: { type: "string", enum: RECURSIVE_OUTPUT_KINDS },
-              findings: { type: "array", items: { type: "string" } },
-              files: { type: "array", items: { type: "string" } },
-              symbols: { type: "array", items: { type: "string" } },
-              evidence_refs: { type: "array", items: { type: "string" } },
-              unknowns: { type: "array", items: { type: "string" } },
-              confidence: { type: "number" },
-              summary: { type: "string" },
-              blockers: { type: "array", items: { type: "string" } },
-              edit_intents: { type: "array", items: { type: "object" } },
-              validation_plans: { type: "array", items: { type: "object" } },
-              tasks: { type: "array", items: { type: "object" } },
-              validation_strategy: { type: "string" },
-              path: { type: "string" },
-              content: { type: "string" },
-              artifact_type: { type: "string" },
-              description: { type: "string" },
-              validation_steps: { type: "array", items: { type: "string" } },
-              completeness_notes: { type: "array", items: { type: "string" } },
-              target_file: { type: "string" },
-              target_symbol_or_range: { type: "string" },
-              operation: { type: "string" },
-              reason: { type: "string" },
-              expected_behavior: { type: "string" },
-              risk: { type: "string" },
-              commands: { type: "array", items: { type: "string" } },
-              smoke_checks: { type: "array", items: { type: "string" } },
-              expected_results: { type: "array", items: { type: "string" } },
-              decision: { type: "string" },
-              required_changes: { type: "array", items: { type: "string" } },
-              risks: { type: "array", items: { type: "string" } },
-              child_outputs_used: { type: "number" },
-              conflicts: { type: "array", items: { type: "string" } },
-              merged_findings: { type: "array", items: { type: "string" } },
-              unresolved_items: { type: "array", items: { type: "string" } }
-            }
-          }
+          structuredSchema
         );
-        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        const { output, summary } = normalizeRecursiveNodeOutput(parsed);
-        node.structuredOutput = output;
-        node.outputSummary = summary;
-      } catch (error) {
-        // Fallback: try plain text invocation
+        let parsed: unknown;
         try {
-          const result = await invokeReasoningProviderText(this.provider, {
-            systemPrompt: `You are an executor agent.\nOriginal goal (full, authoritative): ${node.goalEnvelope.originalGoal}\nExpanded goal/spec: ${node.goalEnvelope.expandedGoal ?? node.goalEnvelope.originalGoal}\nDeliverable contract: ${node.goalEnvelope.expandedGoalSpec?.deliverableContract ?? "Not specified"}\nTheme: ${node.goalEnvelope.theme}\nConstraints: ${node.goalEnvelope.constraints.join(", ")}\nComplete the following task without replacing the required artifact with a summary.${contextBlock ? `\n\n${contextBlock}` : ""}${contextNote}`,
-            userPrompt: node.taskPrompt,
-            maxOutputTokens: 16384
-          });
-          const { output, summary } = wrapTextFallback(result);
+          parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        } catch {
+          parsed = raw;
+        }
+        if (isStructuredNodeOutputValid(parsed)) {
+          const { output, summary } = normalizeRecursiveNodeOutput(parsed);
           node.structuredOutput = output;
           node.outputSummary = summary;
-        } catch (error2) {
-          node.status = "failed";
-          node.errorSummary = `Execution error: ${error2 instanceof Error ? error2.message : String(error2)}`;
-          this.emitNodeStatusChanged(node);
-          this.emitTreeUpdated();
-          return;
+          structuredSuccess = true;
+        } else {
+          rawFirstOutput = parsed;
+        }
+      } catch (firstError) {
+        rawFirstOutput = firstError instanceof Error ? firstError.message : String(firstError);
+      }
+
+      if (!structuredSuccess) {
+        // 1. Preserve original raw response for diagnostics
+        const rawDiagText = typeof rawFirstOutput === "string" ? rawFirstOutput : JSON.stringify(rawFirstOutput ?? "");
+        this.emitDurableEvent("structured_output_recovery_attempt", node.id, {
+          reason: "The previous response did not satisfy the required structured output schema. Attempting recovery.",
+          rawSnippet: rawDiagText.slice(0, 300)
+        });
+
+        // 2. Exactly ONE bounded structured-output recovery attempt using the same schema and task context
+        try {
+          const recoveryUserPrompt = `${node.taskPrompt}\n\nThe previous response did not satisfy the required structured output schema. Return the same result using the required schema only. Do not add new claims or change the proposed solution.`;
+          const recoveryRaw = await invokeReasoningProviderStructured<Record<string, unknown>>(
+            this.provider,
+            {
+              systemPrompt: executorSystemPrompt,
+              userPrompt: recoveryUserPrompt,
+              maxOutputTokens: 16384
+            },
+            structuredSchema
+          );
+          let recoveryParsed: unknown;
+          try {
+            recoveryParsed = typeof recoveryRaw === "string" ? JSON.parse(recoveryRaw) : recoveryRaw;
+          } catch {
+            recoveryParsed = recoveryRaw;
+          }
+          if (isStructuredNodeOutputValid(recoveryParsed)) {
+            const { output, summary } = normalizeRecursiveNodeOutput(recoveryParsed);
+            node.structuredOutput = output;
+            node.outputSummary = summary;
+            structuredSuccess = true;
+            this.emitDurableEvent("structured_output_recovery_succeeded", node.id, {
+              kind: output.kind
+            });
+          } else {
+            this.emitDurableEvent("structured_output_recovery_failed", node.id, {
+              reason: "Recovery response did not satisfy the required structured output schema."
+            });
+          }
+        } catch (retryError) {
+          // Recovery failed; STOP recovery. Do not keep retrying.
+          this.emitDurableEvent("structured_output_recovery_failed", node.id, {
+            reason: retryError instanceof Error ? retryError.message : String(retryError)
+          });
+        }
+      }
+
+      if (!structuredSuccess) {
+        // Recovery failed or was exhausted; retain preserved raw response as diagnostic/fallback text without making further provider calls
+        const rawDiagText = typeof rawFirstOutput === "string" ? rawFirstOutput : JSON.stringify(rawFirstOutput ?? "");
+        const { output, summary } = wrapTextFallback(rawDiagText);
+        node.structuredOutput = output;
+        node.outputSummary = summary;
+      }
+
+      // 3. Bounded semantic implementation recovery (at most 1 per eligible child, bounded run budget)
+      const goalRequiresImplementation = isImplementationGoal(node.goalEnvelope.originalGoal);
+      const nodeRequiresImplementation =
+        node.contract?.responsibility === "IMPLEMENT" ||
+        (node.kind === "root" && goalRequiresImplementation);
+
+      const readiness = assessImplementationPatchReadiness(node.structuredOutput, {
+        originalGoal: node.goalEnvelope.originalGoal,
+        deliverableContract: node.goalEnvelope.expandedGoalSpec?.deliverableContract,
+        workspacePath: this.workspacePath
+      });
+
+      const canAttemptSemanticRecovery =
+        structuredSuccess &&
+        nodeRequiresImplementation &&
+        !readiness.isPatchReady &&
+        !this.semanticRecoveryAttemptsByNode.has(node.id) &&
+        this.totalSemanticRecoveryAttempts < this.maxRunSemanticRecoveries;
+
+      if (canAttemptSemanticRecovery) {
+        this.semanticRecoveryAttemptsByNode.add(node.id);
+        this.totalSemanticRecoveryAttempts++;
+        const missingReq = readiness.missingRequirement || "Your IMPLEMENT contract requires a concrete patch proposal with a valid unified diff or replacement text.";
+        this.emitDurableEvent("semantic_recovery_attempt", node.id, {
+          reason: readiness.reason || "The previous response was structurally valid but did not provide the implementation deliverable required by this task.",
+          missingRequirement: missingReq,
+          previousKind: node.structuredOutput?.kind
+        });
+
+        try {
+          const recoveryUserPrompt = `${node.taskPrompt}\n\nThe previous response was structurally valid but did not provide the implementation deliverable required by this task.\n${missingReq}\nReturn the implementation as the required structured edit/patch output (e.g. kind: "generated_artifact" with path "code_patch.diff" and valid unified diff in content, or kind: "edit_intent" with target_file, exact_old_text, and replacement_text).\nDo not create diagnostic or report files unless explicitly requested.\nDo not change your diagnosis or introduce new claims.`;
+          const recoveryRaw = await invokeReasoningProviderStructured<Record<string, unknown>>(
+            this.provider,
+            {
+              systemPrompt: executorSystemPrompt,
+              userPrompt: recoveryUserPrompt,
+              maxOutputTokens: 16384
+            },
+            structuredSchema
+          );
+          let recoveryParsed: unknown;
+          try {
+            recoveryParsed = typeof recoveryRaw === "string" ? JSON.parse(recoveryRaw) : recoveryRaw;
+          } catch {
+            recoveryParsed = recoveryRaw;
+          }
+          if (isStructuredNodeOutputValid(recoveryParsed)) {
+            const { output, summary } = normalizeRecursiveNodeOutput(recoveryParsed);
+            const recoveryReadiness = assessImplementationPatchReadiness(output, {
+              originalGoal: node.goalEnvelope.originalGoal,
+              deliverableContract: node.goalEnvelope.expandedGoalSpec?.deliverableContract,
+              workspacePath: this.workspacePath
+            });
+            if (recoveryReadiness.isPatchReady) {
+              node.structuredOutput = output;
+              node.outputSummary = summary;
+              this.emitDurableEvent("semantic_recovery_succeeded", node.id, {
+                kind: output.kind,
+                targetFile: recoveryReadiness.targetFile
+              });
+            } else {
+              this.emitDurableEvent("semantic_recovery_failed", node.id, {
+                reason: recoveryReadiness.reason || "Recovery response was structurally valid but did not provide the required implementation deliverable."
+              });
+            }
+          } else {
+            this.emitDurableEvent("semantic_recovery_failed", node.id, {
+              reason: "Recovery response did not satisfy the required structured output schema."
+            });
+          }
+        } catch (retryError) {
+          this.emitDurableEvent("semantic_recovery_failed", node.id, {
+            reason: retryError instanceof Error ? retryError.message : String(retryError)
+          });
         }
       }
     } else {
@@ -1042,14 +1504,25 @@ Return valid JSON with a "kind" field matching one of the above.`;
   }
 
   private async createRepairAgent(parent: RecursiveSwarmNode, collectorNode: RecursiveSwarmNode, collectResult: { unresolvedErrors: string[]; mergedOutput: string }): Promise<void> {
+    const repairContract = createWorkerExecutionContract({
+      nodeId: "pending",
+      parentId: collectorNode.id,
+      localObjective: `Repair the following errors:\n${collectResult.unresolvedErrors.join("\n")}`,
+      originalGoal: parent.goalEnvelope.originalGoal,
+      title: `Repair Agent (${parent.name})`,
+      parentContract: parent.contract,
+      explicitResponsibility: parent.contract?.responsibility === "IMPLEMENT" ? "IMPLEMENT" : "INSPECT"
+    });
     const repairNode = this.createNode({
       name: `Repair Agent (${parent.name})`,
       kind: "repair_agent",
       taskPrompt: `Repair the following errors:\n${collectResult.unresolvedErrors.join("\n")}\n\nCurrent merged output:\n${collectResult.mergedOutput}`,
       goalEnvelope: parent.goalEnvelope,
       parentId: collectorNode.id,
-      depth: parent.depth + 1
+      depth: parent.depth + 1,
+      contract: repairContract
     });
+    repairContract.nodeId = repairNode.id;
     collectorNode.children.push(repairNode.id);
     this.tree.nodes[repairNode.id] = repairNode;
     this.tree.totalNodes++;
@@ -1136,12 +1609,21 @@ Return valid JSON with a "kind" field matching one of the above.`;
     goalEnvelope: GoalEnvelope;
     parentId?: string;
     depth: number;
+    contract?: WorkerExecutionContract;
   }): RecursiveSwarmNode {
     const nodeId = `recursive_node_${randomUUID()}`;
     const pack = this.buildPack?.(input.taskPrompt, nodeId);
     if (pack) {
       this.contextSourceCounts[pack.context_source]++;
     }
+    const contract = input.contract ?? createWorkerExecutionContract({
+      nodeId,
+      parentId: input.parentId,
+      localObjective: extractLocalTaskObjective(input.taskPrompt, input.name),
+      originalGoal: input.goalEnvelope.originalGoal,
+      title: input.name,
+      isRootGoalImplementation: isImplementationGoal(input.goalEnvelope.originalGoal)
+    });
     return {
       schema_version: RECURSIVE_SWARM_SCHEMA_VERSION,
       id: nodeId,
@@ -1160,7 +1642,8 @@ Return valid JSON with a "kind" field matching one of the above.`;
       revision: 1,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      evidencePack: pack
+      evidencePack: pack,
+      contract
     };
   }
 

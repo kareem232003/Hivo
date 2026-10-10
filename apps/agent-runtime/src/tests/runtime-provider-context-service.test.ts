@@ -54,6 +54,33 @@ test("runtime provider context reuses session provider when provider factory own
   assert.equal(context.telemetry.snapshot().providerRequestCount, 3);
 });
 
+test("author, router, and verifier providers share one per-run call limit", async () => {
+  let dispatched = 0;
+  const service = new RuntimeProviderContextService({
+    providerRequestTimeoutMs: 1234,
+    maxProviderCallsPerRun: 2,
+    maxRunWallClockMs: 10_000,
+    getProvider: () => new NamedProvider("author", () => dispatched++),
+    createProvider: (config) => new NamedProvider(config?.selectedModel ?? "missing", () => dispatched++),
+    useSessionProviderForSpecializedModels: false
+  });
+  const context = service.create(session(providerConfig({
+    selectedModel: "author-model",
+    routerModel: "router-model",
+    verifierModel: "verifier-model"
+  })));
+
+  const results = await Promise.allSettled([
+    context.provider.generateText(request()),
+    context.routerProvider.generateText(request()),
+    context.verifierProvider.generateText(request())
+  ]);
+
+  assert.equal(dispatched, 2);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 2);
+  assert.equal(context.telemetry.snapshot().providerRequestCount, 2);
+});
+
 function session(providerConfig: SanitizedProviderConfig): AgentRuntimeSession {
   return ({
     id: "session-provider-context",
@@ -82,9 +109,10 @@ function request(): LlmRequest {
 }
 
 class NamedProvider implements LlmProvider {
-  constructor(private readonly name: string) {}
+  constructor(private readonly name: string, private readonly onCall: () => void = () => {}) {}
 
   async generateText(): Promise<string> {
+    this.onCall();
     return this.name;
   }
 
