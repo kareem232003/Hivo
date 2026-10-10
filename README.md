@@ -352,6 +352,6 @@ This is a capability map for this publication snapshot, based on source inspecti
 - `npm test`: **962 passed, 109 failed, 1,071 total**, run inside the sandbox. This is not a clean pass or a reliable count of product defects; permission restrictions affected some cases.
 - Outside-sandbox recursive/worker/evidence/budget selection: **250 passed, 29 failed, 279 total**. Failures include recursive factory planning/replay and one SQLite lock error. This is concrete evidence that validation remains incomplete even with sandbox restrictions removed.
 - Changed-file runtime tests, run serially outside the sandbox: **253 passed, 0 failed**. This covers all changed/new `.test.ts` files, including the native execution fixture.
-- `git diff --check` on the existing updates reported extra blank lines at EOF in `intent-decision-engine.test.ts` and `recursive-swarm-bugs.test.ts`; left unchanged.
+- `git diff --cached --check` reported extra blank lines at EOF in `intent-decision-engine.test.ts` and `recursive-swarm-bugs.test.ts`, plus trailing whitespace in `run-buggy-calculator-acceptance.ts` and `recursive-source-evidence-resolution.test.ts`; left unchanged.
 
 Raw publication logs remain local under `.agent_memory/publish-*.log`. The update record and this map are committed; generated logs and modified task queues are not part of the update commit. Historical Git commits are retained, including artifacts already tracked in that history.
